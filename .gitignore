@@ -19,6 +19,15 @@ build_assets/
 data/music/temp/
 data/voice/Generated Voice Media/
 data/voice/*/Generated Voice Media/
+data/settings.json
+data/state.json
+data/alarms.json
+data/todos.json
+
+# 安装包与发布文件
+installer/*.exe
+release/*.exe
+release/*.zip
 
 # 本地运行痕迹
 *.log

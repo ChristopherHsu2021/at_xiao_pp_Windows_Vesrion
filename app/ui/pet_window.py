@@ -118,6 +118,7 @@ class PetWindow(QWidget):
         # 使用原生 WM_DROPFILES 兜底，保证透明桌宠也能接收外部文件。
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setObjectName("PetWindow")
+        self.setWindowTitle(config.character.app_name)
 
         self._build()
         self._enable_native_file_drop()

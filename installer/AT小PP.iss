@@ -31,6 +31,8 @@ PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
 RestartApplications=no
+CreateUninstallRegKey=no
+UpdateUninstallLogAppName=no
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"

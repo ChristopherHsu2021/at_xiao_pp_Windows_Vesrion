@@ -35,9 +35,35 @@ from app.ui.settings_window import SettingsWindow
 from app.ui.scene_window import PreparationItemWindow
 from app.ui.install_window import (
     InstallerWindow, UninstallerWindow, acquire_single_instance,
-    show_running_warning, schedule_inno_uninstall_cleanup,
+    show_running_warning, schedule_inno_uninstall_cleanup, is_admin,
+    relaunch_as_admin,
 )
 from app.ui.common import keep_on_top, release_topmost
+
+
+APP_INSTANCE_MUTEX = "Local\\ATXiaoPPMain"
+
+
+def _wake_existing_main_window() -> bool:
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        title = config.character.app_name
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            return False
+        sw_restore = 9
+        sw_shownormal = 1
+        flags = 0x0001 | 0x0002 | 0x0040
+        user32.ShowWindow(hwnd, sw_restore)
+        user32.ShowWindow(hwnd, sw_shownormal)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 
@@ -410,7 +436,14 @@ def main():
         app.setWindowIcon(QIcon(icon_path))
     apply_theme(app)
 
+    if "--custom-uninstall" not in args and "--install" not in args and "--uninstall" not in args:
+        if not acquire_single_instance(APP_INSTANCE_MUTEX):
+            _wake_existing_main_window()
+            return 0
+
     if "--custom-uninstall" in args:
+        if not is_admin() and relaunch_as_admin(sys.argv[1:]):
+            return 0
         if not acquire_single_instance("Local\\ATXiaoPPUninstaller"):
             show_running_warning(tr_hide("卸载正在进行捏~"))
             return 0

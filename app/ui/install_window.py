@@ -413,11 +413,14 @@ def write_custom_uninstall_registry(install_dir: str):
         return
     exe = _installed_exe_path(install_dir)
     try:
+        remove_uninstall_registry()
         import winreg
         key_path = UNINSTALL_REG_ROOT + "\\" + APP_NAME + "_is1"
         key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE)
         uninstall_cmd = f'"{exe}" --custom-uninstall'
-        quiet_cmd = f'"{exe}" --custom-uninstall --quiet'
+        # 保持“应用和功能”里的卸载入口始终进入自定义卸载向导。
+        # 真正的静默清理由程序内部调用 --quiet 完成，不依赖这个注册表值。
+        quiet_cmd = uninstall_cmd
         values = {
             "DisplayName": APP_NAME,
             "DisplayVersion": "beta version 1.0",
@@ -1413,6 +1416,50 @@ class InstallerWindow(QWidget):
         super().mouseReleaseEvent(e)
 
 
+def remove_uninstall_registry():
+    if os.name != "nt":
+        return
+    key_paths = [
+        UNINSTALL_REG_ROOT + "\\" + APP_NAME + "_is1",
+        "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\" + APP_NAME + "_is1",
+    ]
+    for root in ("HKLM", "HKCU"):
+        try:
+            import winreg
+            hive = winreg.HKEY_LOCAL_MACHINE if root == "HKLM" else winreg.HKEY_CURRENT_USER
+            for key_path in key_paths:
+                try:
+                    access = winreg.KEY_READ | winreg.KEY_SET_VALUE
+                    key = winreg.OpenKey(hive, key_path, 0, access)
+                except FileNotFoundError:
+                    continue
+                try:
+                    while True:
+                        try:
+                            name, _, _ = winreg.EnumValue(key, 0)
+                            winreg.DeleteValue(key, name)
+                        except OSError:
+                            break
+                finally:
+                    winreg.CloseKey(key)
+                try:
+                    winreg.DeleteKey(hive, key_path)
+                except FileNotFoundError:
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def remove_user_data():
+    if os.name != "nt":
+        return
+    appdata_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), APP_NAME)
+    try:
+        shutil.rmtree(appdata_dir, ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _installed_dir_from_manifest() -> str:
     manifest_path = os.path.join(_source_dir(), MANIFEST) if getattr(sys, "frozen", False) \
         else os.path.join(os.path.dirname(sys.executable), MANIFEST)
@@ -1433,6 +1480,8 @@ def schedule_uninstall_cleanup():
     """启动隐藏清理脚本，在当前进程退出后删除安装目录。"""
     install_dir = _installed_dir_from_manifest()
     remove_autostart()
+    remove_uninstall_registry()
+    remove_user_data()
     shortcut = os.path.join(os.path.expanduser("~"), "Desktop", f"{APP_NAME}.lnk")
     if os.path.exists(shortcut):
         try:
@@ -1445,6 +1494,8 @@ def schedule_inno_uninstall_cleanup(install_dir: str | None = None):
     """退出自定义卸载 UI 后，隐藏运行 Inno 卸载器并清理用户数据。"""
     install_dir = _norm_install_dir(install_dir or _installed_dir_from_manifest())
     remove_autostart()
+    remove_uninstall_registry()
+    remove_user_data()
     shortcut = os.path.join(os.path.expanduser("~"), "Desktop", f"{APP_NAME}.lnk")
     if os.path.exists(shortcut):
         try:
@@ -1518,6 +1569,28 @@ def schedule_inno_uninstall_cleanup(install_dir: str | None = None):
             shutil.rmtree(install_dir, ignore_errors=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+def is_admin() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def relaunch_as_admin(argv: list[str]) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        params = subprocess.list2cmdline(argv)
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        return rc > 32
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------------- 卸载 ----------------

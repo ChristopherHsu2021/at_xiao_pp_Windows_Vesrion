@@ -34,7 +34,10 @@ a = Analysis(
         ("data/settings.json", "data"),
         ("data/voice/Generated Voice Media", "data/voice/Generated Voice Media"),
         ("data/voice/Upload Voice Media", "data/voice/Upload Voice Media"),
-    ] + collect_data_files("opencc"),
+        ("uninstall_at_xiaopp.bat", "."),
+        ("uninstall_launcher.vbs", "."),
+    ] + collect_data_files("opencc") \
+      + collect_data_files("pypinyin"),
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

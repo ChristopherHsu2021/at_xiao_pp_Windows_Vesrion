@@ -1,5 +1,5 @@
 #define MyAppName "AT小PP"
-#define MyAppVersion "beta version 1.0"
+#define MyAppVersion "1.0"
 #define MyAppPublisher "Christopher Hsu"
 #define MyAppCopyright "Copyright © 2026 Christopher Hsu. All rights reserved."
 #define MyAppExeName "AT小PP.exe"
@@ -42,6 +42,9 @@ Source: "..\dist\AT小PP\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdi
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
 
 [Code]
 function InitializeSetup(): Boolean;

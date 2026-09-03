@@ -74,8 +74,8 @@ def _boot_voice_line(now: datetime | None = None) -> str:
 class App:
     def __init__(self):
         self.pet = PetWindow(self)
-        self.tray = TrayManager(self)
         self.music = MusicPlayer(self)
+        self.tray = TrayManager(self)
         self.windows = {}          # 复用单例窗口
         self.scene = None
         self._scene_kind = None

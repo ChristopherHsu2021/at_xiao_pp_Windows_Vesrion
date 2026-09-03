@@ -175,6 +175,11 @@ def get_music_folder() -> str:
     return pathutil.data_file("music")
 
 
+def get_library_folder() -> str:
+    """用户音乐曲库目录（与卜卜音悦术语对齐，实际等价于 get_music_folder）。"""
+    return get_music_folder()
+
+
 def list_music_files() -> list:
     folder = get_music_folder()
     out = []

@@ -402,6 +402,37 @@ def _isoudy_token(rid: str, br: str, fmt: str) -> str:
     return b64encode(cipher.encrypt(raw + b"\0" * pad)).decode("ascii")
 
 
+# Kuwo (and similar sources) answer a play-URL request with code 200 yet no
+# usable URL when a track is DRM/VIP/copyright restricted -- only a "this song
+# is mobile-app-only" notice (e.g. "当前音乐仅在酷我音乐最新手机版可播放").
+# This must NOT be treated as a generic network/empty failure; it is a distinct
+# 'restricted' outcome that the UI surfaces verbatim to the user.
+_RESTRICTED_HINTS = ("手机版", "版权", "会员专享", "当前音乐仅", "仅可在", "客户端播放")
+
+
+class RemoteResolveError(RuntimeError):
+    """Raised when a remote track URL cannot be resolved.
+
+    kind is one of:
+      - 'network'    -> every resolver was unreachable / timed out / unparseable
+      - 'empty'      -> resolvers answered but no playable (full) URL was returned
+      - 'restricted' -> a resolver explicitly reported the track is DRM/VIP/
+                        copyright-restricted (e.g. Kuwo: '当前音乐仅在酷我音乐
+                        最新手机版可播放'), so no desktop playback URL exists
+    """
+
+    def __init__(self, kind: str, message: str = ""):
+        self.kind = kind
+        super().__init__(message or kind)
+
+
+def _response_restricted(data) -> bool:
+    if not isinstance(data, dict):
+        return False
+    blob = json.dumps(data, ensure_ascii=False)
+    return any(hint in blob for hint in _RESTRICTED_HINTS)
+
+
 def _isoudy_url(item: dict, br: str) -> dict | None:
     rid = str(item.get("rid") or item.get("id") or "").strip()
     if not rid:
@@ -423,6 +454,8 @@ def _isoudy_url(item: dict, br: str) -> dict | None:
             continue
         url = (((data.get("data") or {}) if isinstance(data.get("data"), dict) else {}).get("url") or "").strip()
         if not url:
+            if _response_restricted(data):
+                raise RemoteResolveError("restricted")
             continue
         bitrate, actual_fmt = _quality_from_url(url, want_br)
         return {
@@ -452,6 +485,8 @@ def _play_url(rid: str, br: str) -> dict | None:
             "trial": False,
             "br": br,
         }
+    if isinstance(data, dict) and _response_restricted(data):
+        raise RemoteResolveError("restricted")
     return None
 
 
@@ -465,6 +500,54 @@ def is_full_track(item: dict, info: dict | None) -> bool:
     if expected <= 0 or actual <= 0:
         return True
     return actual >= max(expected - 8, int(expected * 0.90))
+
+
+def _kuwo_anti_url(rid: str, br: str) -> dict | None:
+    """Resolve play URL via antiserver.kuwo.cn (anti-leech CDN frontend)."""
+    data = _request_json("https://antiserver.kuwo.cn/anti.s", {
+        "type": "convert_url",
+        "rid": rid,
+        "format": _format_from_br(br) or "mp3",
+        "br": br,
+        "from": "web",
+    })
+    if not isinstance(data, dict) or data.get("code") != 200:
+        if isinstance(data, dict) and _response_restricted(data):
+            raise RemoteResolveError("restricted")
+        return None
+    url = (data.get("url") or "").strip()
+    if not url and isinstance(data.get("data"), dict):
+        url = (data["data"].get("url") or "").strip()
+    if not url:
+        if _response_restricted(data):
+            raise RemoteResolveError("restricted")
+        return None
+    bitrate, fmt = _quality_from_url(url, br)
+    return {
+        "url": url,
+        "bitrate": bitrate,
+        "format": fmt,
+        "duration": 0,
+        "trial": False,
+        "br": br,
+        "resolver": "kuwo-anti",
+    }
+
+
+def looks_like_trial_clip(out_path: str, item: dict, info: dict) -> bool:
+    """Detect Kuwo's spoken 'use the mobile app' trial clip."""
+    expected_dur = _duration_value(item.get("duration"))
+    if expected_dur <= 90:
+        return False
+    bitrate = _duration_value(info.get("bitrate")) or _quality_from_url(info.get("url", ""), info.get("br", ""))[0]
+    if bitrate <= 0:
+        return False
+    try:
+        size = os.path.getsize(out_path)
+    except OSError:
+        return False
+    implied_seconds = size / (bitrate * 125.0)
+    return implied_seconds < 0.6 * expected_dur
 
 
 def full_url(item: dict, br: str) -> dict | None:
@@ -503,6 +586,79 @@ def search_full(keyword: str, page: int = 0, size: int = 20, candidates: int | N
         if len(out) >= size:
             break
     return out
+
+
+DEFAULT_PREFER = ("128kmp3", "192kmp3", "320kmp3", "300kogg", "48kaac")
+_NETWORK_EXC = (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError)
+
+
+def resolve_playable(item: dict, br: str | None = None) -> dict:
+    """Resolve a FULL-length playable URL, distinguishing network failure
+    from a genuinely missing resource.
+
+    Always returns a dict containing an 'error' key:
+      - None     -> success; url info lives in url/bitrate/format/duration/br/resolver
+      - 'network'-> every resolver raised a network/timeout/parse error
+      - 'empty'  -> resolvers answered but no usable (full) URL was available
+      - 'restricted' -> track explicitly reported as DRM/VIP/copyright restricted
+    """
+    rid = str(item.get("rid") or item.get("id") or "").strip()
+    if not rid:
+        return {"error": "empty"}
+    network_failed = False
+    restricted_seen = False
+
+    def try_one(br_str: str) -> dict | None:
+        nonlocal network_failed, restricted_seen
+        try:
+            info = _isoudy_url(item, br_str)
+        except _NETWORK_EXC:
+            info = None
+            network_failed = True
+        except RemoteResolveError as exc:
+            if exc.kind == "restricted":
+                restricted_seen = True
+            info = None
+        if info and is_full_track(item, info):
+            return info
+        try:
+            info = _play_url(rid, br_str)
+        except _NETWORK_EXC:
+            info = None
+            network_failed = True
+        except RemoteResolveError as exc:
+            if exc.kind == "restricted":
+                restricted_seen = True
+            info = None
+        if info and is_full_track(item, info):
+            return info
+        try:
+            info = _kuwo_anti_url(rid, br_str)
+        except _NETWORK_EXC:
+            info = None
+            network_failed = True
+        except RemoteResolveError:
+            info = None
+        if info and is_full_track(item, info):
+            return info
+        return None
+
+    if br:
+        info = try_one(br)
+        if info:
+            return {**info, "error": None}
+        return {"error": "restricted" if restricted_seen else ("network" if network_failed else "empty")}
+
+    tried: set[str] = set()
+    for want in list(DEFAULT_PREFER) + ["2000kflac"]:
+        br_str = pick_br(item.get("minfo", ""), prefer=(want,))
+        if br_str in tried:
+            continue
+        tried.add(br_str)
+        info = try_one(br_str)
+        if info:
+            return {**info, "error": None}
+    return {"error": "restricted" if restricted_seen else ("network" if network_failed else "empty")}
 
 
 def best_url(item: dict, prefer=("128kmp3", "192kmp3", "320kmp3", "300kogg", "48kaac"), full_only: bool = True) -> dict | None:

@@ -1,7 +1,7 @@
 """主宠物窗：透明无边框、可拖拽、右键菜单、上下文图片切换、悬浮表情包。
 
 图片显示优先级（依据开发需求文档）：
-1. 闲置超过 1 分钟 -> 随机睡觉/左休息/右休息图（播报『累了捏』）
+1. 闲置超过 15 分钟 -> 随机睡觉/左休息/右休息图（播报『累了捏』）
 2. 处于设置的工作时间段且用户未手动切换 -> 工作图（当前职业）
 3. 其余 -> 用户选择的服装图（默认衬衫）
 点击人物 -> 回到服装图（覆盖工作图），刷新交互时间。
@@ -190,7 +190,7 @@ class PetWindow(QWidget):
         """根据上下文决定要显示的图片路径与模式。"""
         if self._forced_image is not None:
             return self._forced_image, "upload"
-        if not state.hidden and state.is_idle(60):
+        if not state.hidden and state.is_idle(15 * 60):
             if self._idle_path is None:
                 self._idle_kind, self._idle_path = self._pick_idle_image()
             return self._idle_path, self._idle_kind
@@ -237,8 +237,12 @@ class PetWindow(QWidget):
         path, mode = self._resolve()
         prev = self.mode
         self.mode = mode
+        # 先绘制/布局以确定最新尺寸，再对 left/right_rest 做贴边定位。
+        # 若先定位后 relayout，right_rest 会按旧宽度计算，导致窗口未贴右边缘，
+        # 下一次刷新才闪现到正确位置。
         if force or path != self._last_path:
             self._draw(path)
+        self._relayout()
         self._position_idle_window()
         if mode == "sleep" and prev != "sleep":
             line = config.character.home.get("idleTimeoutLine", "累了捏")
@@ -246,7 +250,7 @@ class PetWindow(QWidget):
         elif mode in {"left_rest", "right_rest"} and prev not in {"left_rest", "right_rest"}:
             line = config.character.home.get("idleTimeoutLine", "累了捏")
             say(line)
-        self._relayout()
+        self.update()
 
     def _enter_random_outfit(self):
         items = config.character.costume.get("itemList", [])

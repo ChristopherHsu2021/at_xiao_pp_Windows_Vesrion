@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 """自定义安装器外壳打包脚本（one-file / windowed，无控制台黑窗）。
 
-生成：release/AT小PP-beta-version-1.0-setup.exe
+生成：release/AT小PP-version-1.0-setup.exe
 用法：pyinstaller bootstrap.spec --clean --noconfirm
 """
 
@@ -32,6 +32,8 @@ a = Analysis(
     datas=[
         (assets_source, "assets"),
         ("release/at_xiaopp_inner_setup.exe", "."),
+        ("uninstall_at_xiaopp.bat", "."),
+        ("uninstall_launcher.vbs", "."),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -69,7 +71,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="AT小PP-beta-version-1.0-setup",
+    name="AT小PP-version-1.0-setup",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -1,9 +1,4 @@
-"""音乐播放器：QMediaPlayer 后端，支持列表/搜索/上传/循环，以及两种触发模式。
-
-- 歌手（工作）：随机播完整一首，不显示播放器，结束播报后自动关闭隐藏播放器。
-- 听歌（居家）：打开播放器随机播放，切换状态则退出播放器。
-上传按钮位于播放列表面板的搜索栏旁，用户自选音乐存入 data/music。
-"""
+"""音乐播放器：QMediaPlayer 后端，支持本地/缓存/在线歌曲的播放、搜索和上传。"""
 
 import os
 import random
@@ -12,6 +7,12 @@ import shutil
 import threading
 import ctypes
 from ctypes import wintypes
+
+try:
+    from pypinyin import Style, lazy_pinyin
+except ImportError:  # pragma: no cover
+    Style = None
+    lazy_pinyin = None
 
 from PyQt6.QtCore import (
     QAbstractAnimation, QEasingCurve, QPoint, QPointF, QRect, QRectF, QUrl, QTimer, Qt, QSize, QThread, QObject,
@@ -23,17 +24,17 @@ from PyQt6.QtWidgets import (
     QLineEdit, QHBoxLayout, QVBoxLayout, QFileDialog, QGraphicsDropShadowEffect, QMenu,
     QSizePolicy, QTextEdit, QPlainTextEdit, QComboBox, QAbstractSpinBox,
 )
-from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygon
+from PyQt6.QtGui import QBitmap, QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygon, QRegion
 try:
     from PyQt6.QtSvg import QSvgRenderer
 except ImportError:  # pragma: no cover
     QSvgRenderer = None
 
 from app.core import assets, config, covers, lyrics, music_api
-from app.core.voice import on_spoken, say
+from app.core import audio_meta
+from app.core.voice import say
 from app.core.i18n import tr
 from app.ui.context_menu import MENU_QSS
-from app.ui.common import keep_on_top
 
 
 PLAYER_QSS = """
@@ -46,6 +47,11 @@ QWidget#playerCard {
 QLabel#trackTitle { color: #3d2b1f; font-size: 14px; font-weight: 800; }
 QLabel#artist { color: #a08e7a; font-size: 11px; font-weight: 500; }
 QLabel#lyricText { color: #f97510; font-size: 11px; font-weight: 500; }
+QLabel#noticeText {
+    color: rgba(95, 95, 95, 0.58);
+    font-size: 11px;
+    font-weight: 500;
+}
 QLabel#timeText, QLabel#durationText {
     color: #a08e7a;
     font-family: Consolas, 'Cascadia Code', monospace;
@@ -93,11 +99,32 @@ QPushButton#uploadBtn {
     font-size: 15px;
 }
 QPushButton#uploadBtn:hover { background: rgba(249,117,16,0.10); border-color: rgba(249,117,16,0.25); color: #f97510; }
+QWidget#dropOverlay {
+    background: #fffaf5;
+    border-radius: 20px;
+    font-family: 'Microsoft YaHei', 'PingFang SC', 'Segoe UI';
+}
+QLabel#dropMessage { color: #3d2b1f; font-size: 15px; font-weight: 800; }
+QPushButton#dropPrimary, QPushButton#dropSecondary {
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 700;
+    min-height: 34px;
+    padding: 0 20px;
+}
+QPushButton#dropPrimary { background: #f97510; border: none; color: #fff; }
+QPushButton#dropPrimary:hover { background: #ff8a2a; }
+QPushButton#dropSecondary { background: rgba(160,142,122,0.10); border: none; color: #6b5744; }
+QPushButton#dropSecondary:hover { background: rgba(160,142,122,0.18); }
 QScrollArea#playlist {
     background: transparent;
     border: none;
     outline: 0;
 }
+/* 不透明窗口合成下，viewport 与行内 QLabel 默认 QPalette::Window 是不透明色（黑色/系统色），
+   会遮住 PlayerCard 的米白 + bubu 玩偶。显式 transparent，让父级像素透出。 */
+QScrollArea#playlist > QWidget,
+QLabel#trackNum, QLabel#trackDuration, QLabel#trackName { background: transparent; }
 QWidget#playlistBody { background: transparent; }
 QWidget#trackRow { background: transparent; border-radius: 8px; }
 QWidget#trackRow:hover { background: rgba(249,117,16,0.10); }
@@ -107,14 +134,19 @@ QLabel#trackName { color: #3d2b1f; font-size: 13px; font-weight: 500; }
 QLabel#trackDuration { color: #000000; font-family: Consolas, 'Cascadia Code', monospace; font-size: 12px; font-weight: 600; }
 QWidget#trackRow[playing="true"] QLabel#trackNum,
 QWidget#trackRow[playing="true"] QLabel#trackName { color: #f97510; }
+QPushButton#rowDel { background: transparent; border: none; color: #b9a892; font-size: 15px; font-weight: 700; border-radius: 6px; padding: 0; }
+QPushButton#rowDel:hover { background: rgba(229,57,53,0.12); color: #e53935; }
+QPushButton#rowFav { background: transparent; border: none; color: #c9b8a6; font-size: 14px; border-radius: 6px; padding: 0; }
+QPushButton#rowFav[faved="true"] { color: #f97510; }
+QPushButton#rowFav:hover { background: rgba(249,117,16,0.12); color: #f97510; }
 QScrollBar:vertical { width: 4px; background: transparent; margin: 4px 0; }
 QScrollBar::handle:vertical { background: rgba(160,142,122,0.42); border-radius: 2px; min-height: 24px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
 PLAYER_W = 336
-PLAYER_H = 258
-PLAYER_EXPANDED_H = 526
+PLAYER_H = 280
+PLAYER_EXPANDED_H = 548
 PLAYLIST_VISIBLE_ROWS = 5
 TRACK_ROW_H = 36
 REMOTE_PAGE_SIZE = 30
@@ -129,6 +161,11 @@ UPLOAD_SVG = """<svg viewBox='0 0 1024 1024' xmlns='http://www.w3.org/2000/svg'>
 <path d='M924.444444 1024h-796.444444C73.016889 1024 28.444444 978.147556 28.444444 921.6v-117.020444c0-24.234667 19.114667-43.889778 42.666667-43.889778s42.666667 19.626667 42.666667 43.889778V921.6c0 8.078222 6.371556 14.620444 14.222222 14.620444h796.444444c7.850667 0 14.222222-6.542222 14.222223-14.620444v-117.020444c0-24.234667 19.114667-43.889778 42.666666-43.889778s42.666667 19.626667 42.666667 43.889778V921.6c0 56.547556-44.572444 102.4-99.555556 102.4z m-398.222222-948.821333c11.406222 0 22.357333 4.721778 30.378667 13.084444 8.021333 8.334222 12.430222 19.655111 12.288 31.402667v585.130666c0 24.234667-19.114667 43.889778-42.666667 43.889778s-42.666667-19.626667-42.666666-43.889778V119.665778c-0.142222-11.747556 4.266667-23.04 12.288-31.402667a42.097778 42.097778 0 0 1 30.378666-13.084444zM526.222222 0a42.382222 42.382222 0 0 1 30.151111 12.885333l284.444445 292.551111c8.049778 8.192 12.600889 19.342222 12.600889 31.004445 0 11.662222-4.551111 22.840889-12.600889 31.004444a42.097778 42.097778 0 0 1-60.302222 0l-284.444445-292.551111a44.231111 44.231111 0 0 1-12.600889-31.004444c0-11.662222 4.551111-22.812444 12.600889-31.004445A42.382222 42.382222 0 0 1 526.222222 0z m0 0a42.382222 42.382222 0 0 1 30.151111 12.885333c8.049778 8.192 12.600889 19.342222 12.600889 31.004445 0 11.662222-4.551111 22.812444-12.600889 31.004444l-284.444444 292.579556a42.097778 42.097778 0 0 1-60.302222 0 44.231111 44.231111 0 0 1-12.600889-31.004445c0-11.662222 4.551111-22.840889 12.600889-31.004444l284.444444-292.579556A42.382222 42.382222 0 0 1 526.222222 0z' fill='#606060'/>
 </svg>"""
 
+HEART_SVG = """<svg viewBox='0 0 1024 1024' xmlns='http://www.w3.org/2000/svg'>
+<path d='M881.664 132.096c-69.632-69.632-167.936-97.28-263.168-75.776-22.528 5.12-35.84 26.624-30.72 49.152s26.624 35.84 49.152 30.72c67.584-15.36 137.216 4.096 186.368 53.248C926.72 292.864 926.72 460.8 823.296 563.2L512 875.52 199.68 564.224c-102.4-103.424-102.4-271.36 0-373.76 77.824-77.824 204.8-77.824 282.624 0l69.632 69.632c8.192 8.192 77.824 76.8 150.528 76.8h5.12c30.72-1.024 57.344-15.36 77.824-39.936 14.336-17.408 11.264-43.008-6.144-57.344-17.408-14.336-43.008-11.264-57.344 6.144-6.144 8.192-12.288 9.216-17.408 10.24-26.624 2.048-70.656-29.696-93.184-53.248L541.696 133.12c-109.568-109.568-288.768-109.568-399.36 0C7.168 268.288 7.168 487.424 142.336 622.592L483.328 962.56c8.192 8.192 18.432 12.288 28.672 12.288 10.24 0 20.48-4.096 28.672-12.288l340.992-340.992c65.536-65.536 101.376-152.576 101.376-244.736 0-92.16-35.84-179.2-101.376-244.736z' fill='#606060'/>
+<path d='M240.64 233.472c-33.792 30.72-50.176 76.8-50.176 136.192 0 22.528 18.432 40.96 40.96 40.96s40.96-18.432 40.96-40.96c0-34.816 8.192-60.416 23.552-74.752 18.432-17.408 44.032-16.384 46.08-16.384 22.528 2.048 41.984-15.36 44.032-37.888 2.048-22.528-15.36-41.984-37.888-44.032-7.168-1.024-63.488-4.096-107.52 36.864z' fill='#606060'/>
+</svg>"""
+
 
 def _default_lyric() -> str:
     return tr("把这一句留在今天")
@@ -137,6 +174,26 @@ def _default_lyric() -> str:
 def _marked_lyric(text: str) -> str:
     text = (text or _default_lyric()).strip()
     return LYRIC_MARK + text.lstrip("♪ ")
+
+
+def _rounded_pixmap(path: str, size: QSize, radius: int = 18) -> QPixmap:
+    src = QPixmap(path or "")
+    if src.isNull() or size.width() <= 0 or size.height() <= 0:
+        return QPixmap()
+    scaled = src.scaled(size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+    x = max(0, (scaled.width() - size.width()) // 2)
+    y = max(0, (scaled.height() - size.height()) // 2)
+    cropped = scaled.copy(x, y, size.width(), size.height())
+    out = QPixmap(size)
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path_clip = QPainterPath()
+    path_clip.addRoundedRect(QRectF(out.rect()), radius, radius)
+    painter.setClipPath(path_clip)
+    painter.drawPixmap(0, 0, cropped)
+    painter.end()
+    return out
 
 
 def _split_track_artist(path: str) -> tuple[str, str]:
@@ -172,6 +229,53 @@ def _track_search_text(path: str) -> str:
     cached = music_api.cache_info(path) if path else None
     album = cached.get("album", "") if cached else ""
     return f"{title} {artist} {album}".lower()
+
+
+def _pinyin_words(value: str) -> list[str]:
+    value = " ".join(str(value or "").split()).strip()
+    if not value:
+        return []
+    if lazy_pinyin is None:
+        return [value.lower()]
+    return [word.lower() for word in lazy_pinyin(value, errors="default") if word]
+
+
+def _sort_text_key(value: str) -> tuple[int, str, str, str]:
+    raw = " ".join(str(value or "").split()).strip()
+    if not raw:
+        return 1, "", "", ""
+    if lazy_pinyin is not None and Style is not None:
+        initial_words = lazy_pinyin(raw[0], style=Style.FIRST_LETTER, errors="default")
+        initial = (initial_words[0] if initial_words else raw[0]).lower()
+    else:
+        initial = raw[0].lower()
+    full = "".join(_pinyin_words(raw)) or _dedupe_text(raw)
+    return 0, initial[:1], full, raw.lower()
+
+
+def _invert_text(value: str) -> tuple[int, ...]:
+    return tuple(-ord(ch) for ch in value)
+
+
+def _sort_text_key_desc(value: str) -> tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    empty, initial, full, raw = _sort_text_key(value)
+    return empty, _invert_text(initial), _invert_text(full), _invert_text(raw)
+
+
+def _track_sort_title(path: str) -> str:
+    return _track_title(path)
+
+
+def _track_sort_artist(path: str) -> str:
+    return _split_track_artist(path)[1]
+
+
+PLAYLIST_SORT_MODES = {"title_asc", "title_desc", "artist_asc", "artist_desc", "added", "plays"}
+
+
+def _playlist_sort_mode() -> str:
+    mode = config.settings.get("playlistSort", "title_asc")
+    return mode if mode in PLAYLIST_SORT_MODES else "title_asc"
 
 
 def _dedupe_text(value: str) -> str:
@@ -230,6 +334,20 @@ def _album_art_for(path: str) -> str or None:
 
 
 def _parse_duration(path: str) -> str:
+    # 原先每首歌都新建 QMediaPlayer + 阻塞式 QEventLoop 探测时长（最长 500ms/首且冻结主线程），
+    # 曲库较大或每次 refresh 时会造成明显卡顿、列表滑动掉帧。
+    # 改用 app/core/audio_meta.py 的文件头解析：不解码音频、不依赖 Qt、带磁盘缓存，
+    # 可在主线程安全调用；本函数只做格式化，返回字符串与原实现一致。
+    try:
+        if path and os.path.exists(path):
+            secs = audio_meta.get_duration(path)
+            if secs:
+                s = int(secs)
+                return f"{s // 60:02d}:{s % 60:02d}"
+    except Exception:  # noqa: BLE001
+        pass
+    # 回退：audio_meta 未覆盖的格式（如 ogg / ape 等）仍用 QMediaPlayer 探测一次，
+    # 仅这类个别文件会有开销，不影响整体流畅度。
     try:
         if not os.path.exists(path):
             return "--:--"
@@ -273,7 +391,23 @@ class CoverWidget(QWidget):
         self.update()
 
     def _preview_pos(self):
-        return self.mapToGlobal(QPoint(-248, -244))
+        # 固定 hover 位置：让胡萝卜尖精确落在小专辑图左上角。
+        # 计算依据（assets/carrot_hover.png 652x570）：
+        #   - 按 QSize(138,102) + KeepAspectRatio 缩放后实际约 138x120.6；
+        #   - 最低点（底部尖）在原始图中约 (559.5, 569)，缩放后约 (118.4, 120.4)；
+        #   - 预览窗中萝卜以 (234,210) 为中心、旋转 -4° 绘制；
+        #   - 综合后萝卜尖在预览窗本地坐标约 (279, 273)。
+        # 叠加手感微调：再往左 11px、往下合计 23px。
+        # 因此预览窗左上角 = 小专辑图左上角 - (290, 250)。
+        pos = self.mapToGlobal(QPoint(-290, -250))
+        screen = QApplication.screenAt(self.mapToGlobal(self.rect().center())) or self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return pos
+        geo = screen.availableGeometry()
+        preview_w, preview_h = 352, 358
+        x = max(geo.left() + 8, min(pos.x(), geo.right() - preview_w - 8 + 1))
+        y = max(geo.top() + 8, min(pos.y(), geo.bottom() - preview_h - 8 + 1))
+        return QPoint(x, y)
 
     def _source_rect(self):
         return QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
@@ -318,11 +452,10 @@ class CoverWidget(QWidget):
         p.drawEllipse(QRectF(29, 38, 12, 9))
 
     def enterEvent(self, e):  # noqa: N802
-        if self._path and os.path.exists(self._path):
+        if not self._pixmap.isNull():
             if self._preview is None:
                 self._preview = CoverPreviewWindow()
-            self._preview.show_cover(self._path, self._preview_pos(), self._source_rect())
-            keep_on_top(self.window(), bring_to_front=True)
+            self._preview.show_cover_pixmap(self._pixmap, self._preview_pos(), self._source_rect())
         super().enterEvent(e)
 
     def leaveEvent(self, e):  # noqa: N802
@@ -337,6 +470,7 @@ class CoverPreviewWindow(QDialog):
     def __init__(self):
         super().__init__()
         self._pixmap = QPixmap()
+        self._pixmap_key = 0
         self._carrot = QPixmap(assets.find_image("carrot_hover") or "")
         self._path = None
         self._shadow = QColor("#f97510")
@@ -369,23 +503,28 @@ class CoverPreviewWindow(QDialog):
         return self._closing
 
     def show_cover(self, path, pos, source_rect=None):
-        full_geometry = QRect(pos, self.PREVIEW_SIZE)
-        if self.isVisible() and not self._closing and self._path == path and self._full_geometry == full_geometry:
-            return
         pix = QPixmap(path)
         if pix.isNull():
+            return
+        self.show_cover_pixmap(pix, pos, source_rect)
+
+    def show_cover_pixmap(self, pix, pos, source_rect=None):
+        full_geometry = QRect(pos, self.PREVIEW_SIZE)
+        pix_key = pix.cacheKey() if hasattr(pix, "cacheKey") else 0
+        if self.isVisible() and not self._closing and self._pixmap_key == pix_key and self._full_geometry == full_geometry:
             return
         self._closing = False
         self._anim.stop()
         self._fade.stop()
-        self._path = path
-        self._pixmap = pix
+        self._path = ""
+        self._pixmap = QPixmap(pix)
+        self._pixmap_key = pix_key
         self._shadow = _pixmap_theme_color(pix)
         self._full_geometry = full_geometry
-        if source_rect is None:
-            source_rect = QRect(pos.x() + 214, pos.y() + 240, 54, 54)
-        self._collapsed_geometry = QRect(source_rect)
-        self.setGeometry(self._collapsed_geometry)
+        # hover 固定出现在最终位置，不做从小专辑图展开的位移动画，
+        # 只保留透明度渐变，避免视觉上“滑动”。
+        self._collapsed_geometry = full_geometry
+        self.setGeometry(self._full_geometry)
         self.setWindowOpacity(0.0)
         self.show()
         self.raise_()
@@ -637,7 +776,7 @@ class IconButton(QPushButton):
         super().paintEvent(e)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        active_kinds = {"loop_one", "shuffle", "muted"}
+        active_kinds = {"loop_one", "shuffle", "muted", "heart_filled"}
         plain_overlay = bool(self.property("plainOverlay"))
         if plain_overlay:
             color = QColor("#f97510")
@@ -701,6 +840,8 @@ class IconButton(QPushButton):
             self._paint_svg(p, UPLOAD_SVG, color, pad=9)
         elif self.kind == "search":
             self._paint_svg(p, SEARCH_SVG, color, pad=9)
+        elif self.kind in {"heart", "heart_filled"}:
+            self._paint_svg(p, HEART_SVG, color, pad=8)
         elif self.kind == "back":
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawLine(c.x() - 6, c.y() + 2, c.x() + 6, c.y() + 2)
@@ -725,7 +866,12 @@ class IconButton(QPushButton):
         if QSvgRenderer is None:
             return
         painter.save()
-        svg = svg_text.replace("#606060", color.name()).encode("utf-8")
+        svg = (
+            svg_text
+            .replace("#606060", color.name())
+            .replace("#333C4F", color.name())
+            .replace("#000000", color.name())
+        ).encode("utf-8")
         renderer = QSvgRenderer(svg)
         renderer.render(painter, QRectF(pad, pad, self.width() - pad * 2, self.height() - pad * 2))
         painter.restore()
@@ -827,14 +973,39 @@ class SlimSlider(QWidget):
             p.drawEllipse(QPointF(cx, self.height() / 2), 5.5, 5.5)
 
 
+class NoticeLabel(QLabel):
+    def __init__(self):
+        super().__init__()
+        self._raw_text = ""
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_notice_text(self, text: str):
+        self._raw_text = text or ""
+        self.setToolTip(self._raw_text)
+        self._update_elided()
+
+    def resizeEvent(self, e):  # noqa: N802
+        self._update_elided()
+        super().resizeEvent(e)
+
+    def _update_elided(self):
+        if not self._raw_text:
+            super().setText("")
+            return
+        width = max(1, self.width() - 8)
+        super().setText(self.fontMetrics().elidedText(self._raw_text, Qt.TextElideMode.ElideRight, width))
+
+
 class TrackItemWidget(QWidget):
     clicked = pyqtSignal(object)
-    deleteRequested = pyqtSignal(int)
+    deleteRequested = pyqtSignal(str)
+    favoriteRequested = pyqtSignal(str, object, object)  # (source, path, payload)
     downloadRequested = pyqtSignal(object, str)
     addRemoteRequested = pyqtSignal(object)
     saveAsRequested = pyqtSignal(int)
 
-    def __init__(self, number, title, duration, index, playing=False, source="local", payload=None):
+    def __init__(self, number, title, duration, index, playing=False, source="local", payload=None, favorited=False):
         super().__init__()
         self.index = index
         self.source = source
@@ -869,6 +1040,28 @@ class TrackItemWidget(QWidget):
         row.addWidget(num)
         row.addWidget(name, 1)
         row.addWidget(duration_l)
+        self.fav_btn = QPushButton("♡")
+        self.fav_btn.setObjectName("rowFav")
+        self.fav_btn.setFixedSize(20, 20)
+        self.fav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fav_btn.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation, True)
+        self.fav_btn.clicked.connect(self._on_fav_clicked)
+        self.fav_btn.hide()
+        row.addWidget(self.fav_btn)
+        self.del_btn = QPushButton("×")
+        self.del_btn.setObjectName("rowDel")
+        self.del_btn.setFixedSize(20, 20)
+        self.del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.del_btn.setToolTip(tr("删除"))
+        self.del_btn.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation, True)
+        self.del_btn.clicked.connect(self._on_del_clicked)
+        self.del_btn.hide()
+        row.addWidget(self.del_btn)
+        self._set_faved(favorited)
+        self._press_timer = QTimer(self)
+        self._press_timer.setSingleShot(True)
+        self._press_timer.timeout.connect(self._emit_click)
+        self._press_payload = self.payload if self.source == "remote" else self.index
 
     def sizeHint(self):  # noqa: N802
         return QSize(0, TRACK_ROW_H)
@@ -878,18 +1071,58 @@ class TrackItemWidget(QWidget):
 
     def enterEvent(self, e):  # noqa: N802
         self.name_label.start_marquee()
+        self.fav_btn.show()
+        if self.source in ("local", "cache"):
+            self.del_btn.show()
         super().enterEvent(e)
 
     def leaveEvent(self, e):  # noqa: N802
         self.name_label.stop_marquee()
+        self.fav_btn.hide()
+        self.del_btn.hide()
         super().leaveEvent(e)
+
+    def _row_path(self):
+        if isinstance(self.payload, dict):
+            return self.payload.get("cache_path") or self.payload.get("path")
+        if isinstance(self.payload, str):
+            return self.payload
+        return None
+
+    def _set_faved(self, faved):
+        self._faved = bool(faved)
+        self.fav_btn.setText("♥" if self._faved else "♡")
+        self.fav_btn.setProperty("faved", "true" if self._faved else "false")
+        self.fav_btn.setToolTip(tr("已添加到我喜欢") if self._faved else tr("添加到我喜欢"))
+        self.fav_btn.style().unpolish(self.fav_btn)
+        self.fav_btn.style().polish(self.fav_btn)
+
+    def _on_fav_clicked(self):
+        self.favoriteRequested.emit(self.source, self._row_path(), self.payload)
+
+    def _on_del_clicked(self):
+        path = self._row_path()
+        if path:
+            self.deleteRequested.emit(path)
 
     def mousePressEvent(self, e):  # noqa: N802
         if e.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.payload if self.source == "remote" else self.index)
+            self._press_timer.start(QApplication.doubleClickInterval())
             e.accept()
             return
         super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):  # noqa: N802
+        if e.button() == Qt.MouseButton.LeftButton:
+            if self._press_timer.isActive():
+                self._press_timer.stop()
+            self._emit_click()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def _emit_click(self):
+        self.clicked.emit(self._press_payload)
 
     def _add_download_menu(self, menu, payload):
         download_menu = menu.addMenu(tr("下载"))
@@ -901,11 +1134,38 @@ class TrackItemWidget(QWidget):
             action.setData(("download", payload, br))
         return download_menu
 
+    def _add_sort_menu(self, menu):
+        sort_menu = menu.addMenu(tr("排序"))
+        sort_options = (
+            ("title_asc", "歌名（A-Z）"),
+            ("title_desc", "歌名（Z-A）"),
+            ("artist_asc", "歌手（A-Z）"),
+            ("artist_desc", "歌手（Z-A）"),
+            ("added", "添加时间"),
+            ("plays", "播放次数"),
+        )
+        current_sort = _playlist_sort_mode()
+        for sort_key, label_key in sort_options:
+            sort_action = sort_menu.addAction(tr(label_key))
+            sort_action.setCheckable(True)
+            sort_action.setChecked(current_sort == sort_key)
+            sort_action.setData(("sort", sort_key))
+        return sort_menu
+
     def contextMenuEvent(self, e):  # noqa: N802
         if self.source == "status":
             e.accept()
             return
         player_window = self.window()
+        music = getattr(player_window, "music", None)
+        row_index = self.index
+        row_payload = dict(self.payload or {}) if isinstance(self.payload, dict) else self.payload
+        row_source = self.source
+        row_path = None
+        if isinstance(row_payload, dict):
+            row_path = row_payload.get("cache_path") or row_payload.get("path")
+        elif isinstance(row_payload, str):
+            row_path = row_payload
         ctx = getattr(getattr(player_window, "music", None), "ctx", None)
         if ctx is not None and hasattr(ctx, "begin_popup_menu"):
             ctx.begin_popup_menu()
@@ -924,26 +1184,50 @@ QMenu::item {
             delete = None
             save_as = None
             add_remote = None
+            add_favorite = None
             if self.source == "remote":
                 self._add_download_menu(menu, self.payload or {})
+                self._add_sort_menu(menu)
+                add_favorite = menu.addAction(tr("添加到我喜欢"))
                 add_remote = menu.addAction(tr("添加到播放列表"))
             elif self.source == "cache":
                 self._add_download_menu(menu, self.payload or {})
-                delete = menu.addAction(tr("移除缓存"))
+                self._add_sort_menu(menu)
+                delete = menu.addAction(tr("删除"))
+                add_favorite = menu.addAction(tr("添加到我喜欢"))
             else:
                 save_as = menu.addAction(tr("另存为"))
+                self._add_sort_menu(menu)
                 delete = menu.addAction(tr("删除"))
+                add_favorite = menu.addAction(tr("添加到我喜欢"))
             action = menu.exec(e.globalPos())
             data = action.data() if action is not None else None
             if isinstance(data, tuple) and data[0] == "download":
-                self.downloadRequested.emit(data[1], data[2])
+                if music is not None:
+                    music.download_remote(dict(data[1] or {}), data[2])
+            elif isinstance(data, tuple) and data[0] == "sort":
+                if player_window is not None and hasattr(player_window, "set_playlist_sort"):
+                    player_window.set_playlist_sort(data[1])
             elif action == add_remote:
-                self.addRemoteRequested.emit(self.payload or {})
+                if music is not None and row_source == "remote":
+                    music.cache_remote(dict(row_payload or {}))
+            elif action == add_favorite:
+                if music is not None:
+                    if row_source == "remote":
+                        music.favorite_remote(dict(row_payload or {}))
+                    elif row_source == "cache" and row_path:
+                        music.favorite_cached(row_path)
+                    elif row_path:
+                        music.add_favorite_track(row_path)
             elif action == save_as:
-                self.saveAsRequested.emit(self.index)
+                if music is not None and row_path:
+                    music.save_as_track_path(row_path)
             elif action == delete:
-                index = self.index
-                QTimer.singleShot(80, lambda: self.deleteRequested.emit(index))
+                if music is not None and row_path:
+                    if getattr(music, "favorite_mode", False):
+                        QTimer.singleShot(0, lambda m=music, p=row_path: m.remove_favorite_track(p))
+                    else:
+                        QTimer.singleShot(0, lambda m=music, p=row_path: m.delete_track_path_and_sync(p, remove_sidecars=True))
         finally:
             menu.deleteLater()
             if ctx is not None and hasattr(ctx, "end_popup_menu"):
@@ -956,6 +1240,7 @@ class PlayerCard(QWidget):
         super().__init__()
         self.expanded = False
         self.bubu = QPixmap(assets.find_image("bubu_cutout") or "")
+        self._fill_color = QColor("#fffaf5")
 
     def set_expanded(self, expanded):
         self.expanded = expanded
@@ -967,8 +1252,9 @@ class PlayerCard(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         clip = QPainterPath()
         clip.addRoundedRect(QRectF(self.rect()), 20, 20)
+        p.fillPath(clip, self._fill_color)
         p.setClipPath(clip)
-        p.setOpacity(0.70)
+        p.setOpacity(0.62)
         if self.expanded:
             self._paint_bubu_peek(p, mouth_pos=QPointF(self.width() - 18, self.height() - 28), scale=1.14)
         else:
@@ -988,11 +1274,6 @@ class PlayerCard(QWidget):
 
 class DuplicateTrackError(RuntimeError):
     pass
-
-
-class MusicPlayerSignals(QObject):
-    singerTrackReady = pyqtSignal(object, object)
-    singerOutroFinished = pyqtSignal()
 
 
 class GUITHREADINFO(ctypes.Structure):
@@ -1039,6 +1320,7 @@ class GlobalMusicSpaceFilter(QObject):
         self._uia = None
         self._last_global_space_ms = 0
         self._space_enabled = False
+        self._self_pid = os.getpid()
         self.toggleRequested.connect(self._toggle_from_main_thread)
         self.music.player.playbackStateChanged.connect(lambda _state: self._sync_space_enabled())
         self.music.player.sourceChanged.connect(lambda _source: self._sync_space_enabled())
@@ -1154,7 +1436,9 @@ class GlobalMusicSpaceFilter(QObject):
             return False
         if self._modifier_pressed():
             return False
-        if self._foreground_looks_like_input():
+        # 仅在 AT小PP 自己的窗口处于前台时才响应全局空格，
+        # 避免用户在其它软件（如聊天、办公、浏览器输入框）打字时被误触发。
+        if not self._foreground_is_self():
             return False
         return True
 
@@ -1204,6 +1488,19 @@ class GlobalMusicSpaceFilter(QObject):
                 )
                 return any(token in foreground_class or token in lowered for token in cautious_tokens)
             return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _foreground_is_self(self):
+        """判断当前前台窗口是否属于本应用进程。"""
+        try:
+            user32 = ctypes.windll.user32
+            foreground = user32.GetForegroundWindow()
+            if not foreground:
+                return False
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(foreground, ctypes.byref(pid))
+            return pid.value == self._self_pid
         except Exception:  # noqa: BLE001
             return False
 
@@ -1296,6 +1593,9 @@ class MarqueeLabel(QLabel):
     def paintEvent(self, e):  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        # 用户明确要求列表区完全透明，让 PlayerCard 的米白 + bubu 完整透出
+        # （包括歌名区下方的橙身/眼睛）。因此 MarqueeLabel 不再 fillRect 清底——
+        # 代价是跑马灯长标题时仍可能闪现灰色乱码堆（这是用户接受的取舍）。
         row = self.parentWidget()
         playing = row.property("playing") == "true" if row is not None else False
         p.setPen(QColor("#f97510") if playing else QColor("#3d2b1f"))
@@ -1376,6 +1676,9 @@ class GradientLyricLabel(QWidget):
     def paintEvent(self, e):  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(self.rect(), Qt.GlobalColor.transparent)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         text = self._text.strip() or _marked_lyric(_default_lyric())
         font = QFont("Microsoft YaHei", self._font_size)
         font.setWeight(QFont.Weight.DemiBold)
@@ -1417,7 +1720,7 @@ class GradientLyricLabel(QWidget):
 
 
 class LyricOverlayWindow(QDialog):
-    BASE_W = 650
+    BASE_W = 730
     BASE_H = 94
 
     def __init__(self, music):
@@ -1458,13 +1761,15 @@ class LyricOverlayWindow(QDialog):
         self.next_b = IconButton("next", 30)
         self.font_up_b = QPushButton("A+")
         self.font_down_b = QPushButton("A-")
+        self.lyric_plus_b = QPushButton("L+")
+        self.lyric_minus_b = QPushButton("L-")
         self.color_b = IconButton("palette", 30)
         self._icon_buttons = [self.loop_b, self.prev_b, self.play_b, self.next_b, self.color_b]
         for b in (self.loop_b, self.prev_b, self.play_b, self.next_b, self.color_b):
             b.setProperty("plainOverlay", True)
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setStyleSheet("QPushButton { background: transparent; border: none; } QPushButton:hover { background: transparent; border: none; }")
-        for b in (self.font_up_b, self.font_down_b):
+        for b in (self.font_up_b, self.font_down_b, self.lyric_plus_b, self.lyric_minus_b):
             b.setObjectName("toolBtn")
             b.setFixedSize(48, 26)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1481,20 +1786,24 @@ QPushButton#toolBtn {
 }
 QPushButton#toolBtn:hover { color: #ff9a3d; }
 """)
-        self._font_buttons = [self.font_up_b, self.font_down_b]
+        self._font_buttons = [self.font_up_b, self.font_down_b, self.lyric_plus_b, self.lyric_minus_b]
         self.loop_b.setToolTip(tr("循环模式"))
         self.prev_b.setToolTip(tr("上一首"))
         self.play_b.setToolTip(tr("播放/暂停"))
         self.next_b.setToolTip(tr("下一首"))
         self.color_b.setToolTip(tr("歌词颜色"))
+        self.lyric_plus_b.setToolTip(tr("歌词前进 0.5 秒"))
+        self.lyric_minus_b.setToolTip(tr("歌词后退 0.5 秒"))
         self.loop_b.clicked.connect(self.music.cycle_loop)
         self.prev_b.clicked.connect(self.music.prev)
         self.play_b.clicked.connect(self.music.toggle_play)
         self.next_b.clicked.connect(self.music.next)
         self.font_up_b.clicked.connect(lambda: self.lyric.set_font_size(self.lyric.font_size() + 2))
         self.font_down_b.clicked.connect(lambda: self.lyric.set_font_size(self.lyric.font_size() - 2))
+        self.lyric_plus_b.clicked.connect(lambda: self._shift_current_lyric(500))
+        self.lyric_minus_b.clicked.connect(lambda: self._shift_current_lyric(-500))
         self.color_b.clicked.connect(self._toggle_palette)
-        for b in (self.loop_b, self.prev_b, self.play_b, self.next_b, self.font_up_b, self.font_down_b, self.color_b):
+        for b in (self.loop_b, self.prev_b, self.play_b, self.next_b, self.font_up_b, self.font_down_b, self.lyric_plus_b, self.lyric_minus_b, self.color_b):
             controls.addWidget(self._control_slot(b))
         controls.addStretch(1)
         root.addLayout(controls)
@@ -1559,7 +1868,7 @@ QPushButton#toolBtn:hover {{ color: #ff9a3d; }}
 """)
         for swatch in self._swatches:
             swatch.setFixedSize(int(18 * s), int(18 * s))
-        self.lyric.setMinimumSize(int(480 * s), int(46 * s))
+        self.lyric.setMinimumSize(int(560 * s), int(46 * s))
         self.lyric.set_font_size(int(25 * s))
         self._dock_bottom_center()
 
@@ -1604,6 +1913,12 @@ QPushButton#toolBtn:hover {{ color: #ff9a3d; }}
         self.play_b.update()
         text, progress = self.music.lyric_display(self.music.player.position())
         self.lyric.set_text(text, progress)
+
+    def _shift_current_lyric(self, delta_ms):
+        if not self.music.shift_current_lyric(delta_ms):
+            return
+        self.sync()
+        self.music.force_refresh_lyric_render()
 
     def mousePressEvent(self, e):  # noqa: N802
         if e.button() == Qt.MouseButton.LeftButton:
@@ -1669,6 +1984,8 @@ QPushButton#toolBtn:hover {{ color: #ff9a3d; }}
         self.play_b.setToolTip(tr("播放/暂停"))
         self.next_b.setToolTip(tr("下一首"))
         self.color_b.setToolTip(tr("歌词颜色"))
+        self.lyric_plus_b.setToolTip(tr("歌词前进 0.5 秒"))
+        self.lyric_minus_b.setToolTip(tr("歌词后退 0.5 秒"))
         self.sync()
 
 
@@ -1691,9 +2008,20 @@ class PlayerWindow(QDialog):
         self._remote_loading = False
         self._remote_token = 0
         self._remote_error = ""
+        self._playlist_render_pending = False
+        self._pending_drop_files = []
+        self._drop_image_name = "drop_upload_prompt"
+        self._refresh_timer = None  # 曲库刷新 debounce 定时器（见 _schedule_library_refresh）
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # 圆角改用「不透明窗口 + 遮罩」实现，不再使用 WA_TranslucentBackground：
+        # 在 translucent 窗口下，子控件的 background: transparent 会「透到桌面」而不是
+        # 透到父控件，导致列表区直接显示桌面壁纸/图标，而不是 PlayerCard 的米白 + bubu 玩偶。
+        # 改为不透明窗口后，子控件的 transparent 会正确借到父控件（PlayerCard 米白+bubu）的像素；
+        # 圆角外的像素由遮罩排除、不予绘制，视觉上仍是「圆角卡片浮在桌面」。
+        # 只影响「窗口如何合成到屏幕」，不改动任何颜色/样式/布局。
+        self.setAcceptDrops(True)
         self.setFixedSize(PLAYER_W, PLAYER_H)
+        self._apply_window_mask()
         self._build()
         self._disable_default_buttons()
         self.installEventFilter(self)
@@ -1702,6 +2030,36 @@ class PlayerWindow(QDialog):
         self.remoteDownloadReady.connect(self._on_remote_download_ready)
         music.player.positionChanged.connect(self._on_pos)
         music.player.durationChanged.connect(self._on_dur)
+
+    def _apply_window_mask(self, radius: int = 20):
+        """用 QBitmap 遮罩为窗口做圆角（配合「不透明窗口」使用）。
+
+        QRegion 不直接支持圆角矩形（只有 Rectangle / Ellipse），所以先在 QBitmap 上
+        画一个圆角实心矩形，再转成 QRegion 作为遮罩：遮罩内正常绘制、遮罩外不绘制
+        （透出桌面），从而得到与原先 translucent 窗口一致的圆角外观。
+
+        圆角半径与 PlayerCard.paintEvent 的 addRoundedRect(20, 20) 保持一致。
+        本方法只影响「窗口如何合成到屏幕」，不触碰任何颜色/样式/布局。
+        """
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        mask = QBitmap(QSize(w, h))
+        mask.clear()
+        p = QPainter(mask)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setBrush(Qt.BrushStyle.SolidPattern)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), radius, radius)
+        p.end()
+        self.setMask(QRegion(mask))
+
+    def closeEvent(self, event):
+        if getattr(self.music, "_closing", False):
+            event.accept()
+            return
+        self.music.close_player()
+        event.ignore()
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -1727,7 +2085,7 @@ class PlayerWindow(QDialog):
         win_row.setSpacing(6)
         self.back_b = IconButton("back", 22)
         self.close_b = IconButton("close", 22)
-        self.back_b.setToolTip(tr("返回"))
+        self.back_b.setToolTip(tr("最小化"))
         self.close_b.setToolTip(tr("退出播放器"))
         self.back_b.clicked.connect(self.showMinimized)
         self.close_b.clicked.connect(self.music.close_player)
@@ -1813,7 +2171,14 @@ class PlayerWindow(QDialog):
         bottom.addWidget(self.vol, 1)
         bottom.addWidget(self.list_b)
         body.addLayout(bottom)
-        body.addSpacing(17)
+        body.addSpacing(8)
+
+        self.notice = NoticeLabel()
+        self.notice.setObjectName("noticeText")
+        self.notice.setMinimumHeight(16)
+        self.notice.set_notice_text(tr("仅供学习交流使用，请支持正版音乐！"))
+        body.addWidget(self.notice)
+        body.addSpacing(10)
 
         self.playlist_panel = QWidget()
         self.playlist_panel.setObjectName("playlistPanel")
@@ -1834,11 +2199,16 @@ class PlayerWindow(QDialog):
         self.upload_b.setObjectName("uploadBtn")
         self.upload_b.setToolTip(tr("上传音乐"))
         self.upload_b.clicked.connect(self.music.upload)
+        self.favorite_b = IconButton("heart", 36)
+        self.favorite_b.setObjectName("uploadBtn")
+        self.favorite_b.setToolTip(tr("我喜欢的歌曲"))
+        self.favorite_b.clicked.connect(self.music.toggle_favorite_mode)
         search_row = QHBoxLayout()
         search_row.setContentsMargins(0, 0, 0, 0)
         search_row.setSpacing(7)
         search_row.addWidget(self.search, 1)
         search_row.addWidget(self.search_b)
+        search_row.addWidget(self.favorite_b)
         search_row.addWidget(self.upload_b)
         panel.addLayout(search_row)
         self.list = QScrollArea()
@@ -1856,7 +2226,42 @@ class PlayerWindow(QDialog):
         panel.addWidget(self.list)
         self.playlist_panel.hide()
         body.addWidget(self.playlist_panel)
-        self._filter("")
+        self._build_drop_overlay()
+
+    def _build_drop_overlay(self):
+        self.drop_overlay = QWidget(self.card)
+        self.drop_overlay.setObjectName("dropOverlay")
+        self.drop_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QVBoxLayout(self.drop_overlay)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        self.drop_image = QLabel()
+        self.drop_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.drop_image)
+        self.drop_message = QLabel()
+        self.drop_message.setObjectName("dropMessage")
+        self.drop_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.drop_message.setWordWrap(True)
+        layout.addWidget(self.drop_message)
+        self.drop_buttons = QWidget()
+        btn_row = QHBoxLayout(self.drop_buttons)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        self.drop_yes_b = QPushButton(tr("是"))
+        self.drop_yes_b.setObjectName("dropPrimary")
+        self.drop_no_b = QPushButton(tr("否"))
+        self.drop_no_b.setObjectName("dropSecondary")
+        self.drop_yes_b.clicked.connect(self._confirm_drop_upload)
+        self.drop_no_b.clicked.connect(self._cancel_drop_upload)
+        btn_row.addWidget(self.drop_yes_b)
+        btn_row.addWidget(self.drop_no_b)
+        btn_row.addStretch(1)
+        layout.addWidget(self.drop_buttons)
+        layout.addStretch(1)
+        self.drop_overlay.hide()
+        self._layout_drop_overlay()
 
     def _disable_default_buttons(self):
         for button in self.findChildren(QPushButton):
@@ -1878,6 +2283,101 @@ class PlayerWindow(QDialog):
         if obj is self and event.type() == QEvent.Type.KeyPress:
             return self._handle_player_key(event)
         return super().eventFilter(obj, event)
+
+    def _layout_drop_overlay(self):
+        if not hasattr(self, "drop_overlay"):
+            return
+        self.drop_overlay.setGeometry(self.card.rect())
+        if hasattr(self, "drop_image"):
+            image_h = 168 if self.height() <= PLAYER_H + 12 else 230
+            self.drop_image.setFixedHeight(image_h)
+            if self.drop_overlay.isVisible():
+                img = assets.find_image(self._drop_image_name)
+                self.drop_image.setPixmap(_rounded_pixmap(img or "", QSize(286, image_h), 16))
+
+    def resizeEvent(self, e):  # noqa: N802
+        self._layout_drop_overlay()
+        self._apply_window_mask()
+        super().resizeEvent(e)
+
+    def _dropped_local_files(self, event):
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return []
+        paths = []
+        for url in mime.urls():
+            if url.isLocalFile():
+                paths.append(url.toLocalFile())
+        return paths
+
+    def _is_supported_drop_audio(self, path):
+        if not path or os.path.splitext(path)[1].lower() == ".mp4":
+            return False
+        return assets.is_audio_file(path)
+
+    def dragEnterEvent(self, event):  # noqa: N802
+        if self._dropped_local_files(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):  # noqa: N802
+        if self._dropped_local_files(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):  # noqa: N802
+        files = self._dropped_local_files(event)
+        if not files:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.music.pause_for_drop()
+        audio_files = [p for p in files if self._is_supported_drop_audio(p)]
+        if audio_files:
+            self._pending_drop_files = audio_files
+            self._show_drop_overlay(tr("是否上传该歌曲？"), "drop_upload_prompt", show_buttons=True)
+        else:
+            self._pending_drop_files = []
+            self._show_drop_overlay(
+                tr("我暂时不支持这种文件类型哦！"),
+                "drop_upload_prompt",
+                show_buttons=False,
+                auto_restore=True,
+                restore_delay_ms=750,
+            )
+
+    def _show_drop_overlay(self, message, image_name, show_buttons=False, auto_restore=False, restore_delay_ms=2000):
+        self._drop_image_name = image_name
+        self.drop_message.setText(message)
+        self.drop_buttons.setVisible(show_buttons)
+        img = assets.find_image(image_name)
+        pix = _rounded_pixmap(img or "", QSize(286, 168), 16)
+        self.drop_image.setPixmap(pix)
+        self.drop_overlay.raise_()
+        self.drop_overlay.show()
+        if auto_restore:
+            QTimer.singleShot(restore_delay_ms, self._hide_drop_overlay)
+
+    def _hide_drop_overlay(self):
+        self.drop_overlay.hide()
+        self._pending_drop_files = []
+
+    def _cancel_drop_upload(self):
+        self._hide_drop_overlay()
+
+    def _confirm_drop_upload(self):
+        files = list(self._pending_drop_files)
+        if not files:
+            self._hide_drop_overlay()
+            return
+        imported = self.music.add_files(files)
+        self._pending_drop_files = []
+        if imported:
+            self._show_drop_overlay(tr("上传成功了！"), "drop_upload_success", show_buttons=False, auto_restore=True, restore_delay_ms=750)
+        else:
+            self._show_drop_overlay(tr("歌曲已存在"), "drop_upload_prompt", show_buttons=False, auto_restore=True)
 
     def begin_open_session(self):
         self._auto_dock_enabled = True
@@ -1978,13 +2478,24 @@ class PlayerWindow(QDialog):
 
     def toggle_playlist(self):
         self._expanded = not self._expanded
-        self.music.refresh_tracks()
         self.playlist_panel.setVisible(self._expanded)
         self.card.set_expanded(self._expanded)
         self.setFixedSize(PLAYER_W, PLAYER_EXPANDED_H if self._expanded else PLAYER_H)
         if self._auto_dock_enabled:
             self._dock_to_work_area_bottom()
-        self._filter(self._search_query)
+        if self._expanded:
+            self._render_playlist_soon()
+
+    def _render_playlist_soon(self):
+        if self._playlist_render_pending:
+            return
+        self._playlist_render_pending = True
+        QTimer.singleShot(0, self._render_playlist_now)
+
+    def _render_playlist_now(self):
+        self._playlist_render_pending = False
+        if self._expanded:
+            self._filter(self._search_query, refresh=False)
 
     def perform_search(self):
         query = " ".join(self.search.text().split())
@@ -1995,7 +2506,7 @@ class PlayerWindow(QDialog):
         self._remote_has_more = False
         self._remote_error = ""
         self._filter(query)
-        if query:
+        if query and not self.music.favorite_mode:
             self._search_remote(query, reset=True)
 
     def _on_search_changed(self, text):
@@ -2075,23 +2586,115 @@ class PlayerWindow(QDialog):
 
     def _on_remote_play_ready(self, payload, error):
         if error:
-            say(tr("这首歌暂时没有完整版资源"))
+            if error == "network":
+                say(tr("无法连接音乐服务，请检查网络后重试"))
+            elif error == "empty":
+                say(tr("这首歌暂时没有完整版资源"))
+            elif error == "restricted":
+                say(tr("该歌曲暂无版权"))
+            else:
+                say(tr("播放出错噜"))
             return
-        self.music.play_cached(payload)
+        # 搜索进行中：缓存播放完成时不重渲染列表，保持用户当前浏览位置
+        self.music.play_cached(payload, sync_ui=not bool(self._search_query))
 
     def _on_remote_download_ready(self, payload, error):
         if error:
             if error == "歌曲已存在":
                 say(tr("歌曲已存在"))
                 return
-            say(tr("这首歌暂时没有完整版资源"))
+            if error == "network":
+                say(tr("无法连接音乐服务，请检查网络后重试"))
+                return
+            if error == "empty":
+                say(tr("这首歌暂时没有完整版资源"))
+                return
+            if error == "restricted":
+                say(tr("该歌曲暂无版权"))
+                return
+            say(tr("下载出错噜"))
             return
         remove_cache_path = (payload or {}).get("remove_cache_path")
         if remove_cache_path:
             self.music.delete_track_path(remove_cache_path, remove_sidecars=False)
+        if (payload or {}).get("add_favorite") and (payload or {}).get("path"):
+            self.music.add_favorite_track(payload.get("path"), announce=False)
+        # 短时间内连续下载时，每个完成回调都 refresh_tracks()（全量磁盘扫描 + 时长解析）
+        # 再 sync()（销毁重建所有行控件），主线程被反复占满 → 列表滑动掉帧。
+        # 改用 300ms debounce 把多次「下载完成」合并成一次刷新。
+        self._schedule_library_refresh()
+        say(tr("已添加到我喜欢") if (payload or {}).get("add_favorite") else tr("下载完成"))
+
+    def _schedule_library_refresh(self):
+        """合并短时间内的多次曲库刷新请求为一次（300ms debounce）。"""
+        if self._refresh_timer is None:
+            self._refresh_timer = QTimer(self)
+            self._refresh_timer.setSingleShot(True)
+            self._refresh_timer.timeout.connect(self._flush_library_refresh)
+        self._refresh_timer.start(300)
+
+    def _flush_library_refresh(self):
+        self.music.refresh_tracks()
+        # 搜索进行中：不重建播放列表，避免下载完成把列表跳回顶部、打断浏览；
+        # 底层数据已刷新，最终列表在清空搜索框时统一呈现。
+        if not self._search_query:
+            self.sync()
+
+    def _sorted_tracks(self, tracks):
+        sort_mode = _playlist_sort_mode()
+        if sort_mode == "added":
+            return sorted(
+                tracks,
+                key=lambda p: (
+                    -(int((music_api.cache_info(p) or {}).get("created") or 0)),
+                    _sort_text_key(_track_sort_title(p)),
+                    p,
+                ),
+            )
+        if sort_mode == "title_desc":
+            return sorted(
+                tracks,
+                key=lambda p: (_sort_text_key_desc(_track_sort_title(p)), p),
+            )
+        if sort_mode == "artist_asc":
+            return sorted(tracks, key=lambda p: (_sort_text_key(_track_sort_artist(p)), _sort_text_key(_track_sort_title(p)), p))
+        if sort_mode == "artist_desc":
+            return sorted(tracks, key=lambda p: (_sort_text_key_desc(_track_sort_artist(p)), _sort_text_key(_track_sort_title(p)), p))
+        if sort_mode == "plays":
+            play_counts = config.settings.get("trackPlayCounts", {}) or {}
+            return sorted(
+                tracks,
+                key=lambda p: (
+                    -int(play_counts.get(os.path.normcase(os.path.abspath(p)), 0) or 0),
+                    _sort_text_key(_track_sort_title(p)),
+                    p,
+                ),
+            )
+        return sorted(tracks, key=lambda p: (_sort_text_key(_track_sort_title(p)), p))
+
+    def set_playlist_sort(self, sort_key):
+        if sort_key not in PLAYLIST_SORT_MODES:
+            return
+        config.settings.set("playlistSort", sort_key, save=True)
         self.music.refresh_tracks()
         self.sync()
-        say(tr("下载完成"))
+
+    def on_favorite_requested(self, source, path, payload):
+        """行内爱心按钮：切换「我喜欢的」状态——已收藏则取消、未收藏则添加（与右键菜单语义一致）。"""
+        music = self.music
+        if music is None:
+            return
+        if source == "remote":
+            music.favorite_remote(dict(payload or {}))
+            return
+        if not path:
+            return
+        if music.is_favorite_track(path):
+            music.remove_favorite_track(path)
+        elif source == "cache":
+            music.favorite_cached(path)
+        else:
+            music.add_favorite_track(path)
 
     def _filter(self, text, refresh=True):
         if refresh:
@@ -2114,14 +2717,26 @@ class PlayerWindow(QDialog):
                 payload = music_api.cache_info(p) if source == "cache" else None
                 if payload is not None:
                     payload = {**payload, "cache_path": p, "minfo": payload.get("minfo", "")}
-                row = TrackItemWidget(mark, title, duration, i, i == self.music.index, source=source, payload=payload)
+                elif source == "local":
+                    payload = p
+                favorited = self.music.is_favorite_track(p)
+                row = TrackItemWidget(mark, title, duration, i, i == self.music.index, source=source, payload=payload, favorited=favorited)
                 row.clicked.connect(self.music.play_index)
-                row.deleteRequested.connect(self.music.delete_track)
+                # 普通播放列表：删除文件并立即渲染；
+                # 「我喜欢的」视图：仅移除收藏、不删文件（与右键"删除"语义一致）
+                row.deleteRequested.connect(
+                    lambda p, pw=self: (
+                        pw.music.remove_favorite_track(p)
+                        if pw.music.favorite_mode
+                        else pw.music.delete_track_path_and_sync(p, remove_sidecars=True)
+                    )
+                )
+                row.favoriteRequested.connect(self.on_favorite_requested)
                 row.downloadRequested.connect(self.music.download_remote)
                 row.saveAsRequested.connect(self.music.save_as_track)
                 self.playlist_layout.addWidget(row)
                 matches += 1
-        if query:
+        if query and not self.music.favorite_mode:
             if self._remote_loading:
                 self.playlist_layout.addWidget(TrackItemWidget("", tr("搜索中..."), "", -1, source="status"))
             elif self._remote_error:
@@ -2140,14 +2755,18 @@ class PlayerWindow(QDialog):
                         False,
                         source="remote",
                         payload=item,
+                        favorited=False,
                     )
                     row.clicked.connect(self.music.play_remote)
                     row.downloadRequested.connect(self.music.download_remote)
                     row.addRemoteRequested.connect(self.music.cache_remote)
+                    row.favoriteRequested.connect(self.on_favorite_requested)
                     self.playlist_layout.addWidget(row)
                     matches += 1
                 if not self._remote_results and matches == 0:
                     self.playlist_layout.addWidget(TrackItemWidget("", tr("没有搜到结果"), "", -1, source="status"))
+        elif self.music.favorite_mode and matches == 0:
+            self.playlist_layout.addWidget(TrackItemWidget("", tr("没有搜到结果"), "", -1, source="status"))
         self.playlist_layout.addStretch(1)
         return matches
 
@@ -2198,6 +2817,11 @@ class PlayerWindow(QDialog):
 
     def sync(self):
         self.music.refresh_tracks()
+        self._sync_from_state()
+        self.vol.setValue(self.music._volume)
+        self._sync_volume_icon(self.music._volume)
+
+    def _sync_from_state(self):
         if self.music.tracks:
             self.music.index = max(0, min(self.music.index, len(self.music.tracks) - 1))
             track = self.music.tracks[self.music.index]
@@ -2212,6 +2836,8 @@ class PlayerWindow(QDialog):
             self.play_b.update()
             self.loop_b.kind = ["loop", "loop_one", "shuffle"][self.music.loop]
             self.loop_b.update()
+            self.favorite_b.kind = "heart_filled" if self.music.favorite_mode else "heart"
+            self.favorite_b.update()
             self._sync_volume_icon(self.vol.value())
         else:
             self.title.setText(tr("未在播放"))
@@ -2221,16 +2847,23 @@ class PlayerWindow(QDialog):
             self.cur_t.setText("00:00")
             self.dur_t.setText("00:00")
             self.prog.setValue(0)
-        self._filter(self._search_query, refresh=False)
-        self.vol.setValue(self.music._volume)
-        self._sync_volume_icon(self.music._volume)
+            self.favorite_b.kind = "heart_filled" if self.music.favorite_mode else "heart"
+            self.favorite_b.update()
+        if self._expanded:
+            self._filter(self._search_query, refresh=False)
+
+    def refresh_display(self):
+        self._sync_from_state()
 
     def retranslate_ui(self):
-        self.back_b.setToolTip(tr("返回"))
+        self.back_b.setToolTip(tr("最小化"))
         self.close_b.setToolTip(tr("退出播放器"))
         self.search.setPlaceholderText(tr("搜索歌曲..."))
         self.search_b.setToolTip(tr("搜索歌曲"))
         self.upload_b.setToolTip(tr("上传音乐"))
+        self.favorite_b.setToolTip(tr("我喜欢的歌曲"))
+        if hasattr(self, "notice"):
+            self.notice.set_notice_text(tr("仅供学习交流使用，请支持正版音乐！"))
         self.sync()
 
 
@@ -2245,28 +2878,27 @@ class MusicPlayer:
         self.player.setAudioOutput(self.audio)
         self.tracks = []
         self.index = 0
+        self.favorite_mode = False
         self.loop = 0  # 0 列表循环 / 1 单曲循环 / 2 随机
         self._muted = False
         self._volume = DEFAULT_MUSIC_VOLUME
         self._duration_cache = {}
         self._lyric_cache = {}
+        self._cover_by_path: dict[str, str] = {}
         self._kuwo_lyric_requested = set()
-        self._alarm_mode = False
-        self._singer_show_active = False
-        self._singer_show_started_visible = False
-        self._signals = MusicPlayerSignals()
-        self._signals.singerTrackReady.connect(self._on_singer_track_ready)
-        self._signals.singerOutroFinished.connect(self._close_after_singer_outro)
+        self._remote_download_lock = threading.Lock()
         self._global_space_filter = GlobalMusicSpaceFilter(self)
-        self._singer_timer = QTimer()
-        self._singer_timer.setSingleShot(True)
-        self._singer_timer.timeout.connect(self._stop_singer)
         self.player.mediaStatusChanged.connect(self._on_status)
         self._apply_player_loops()
         self.set_volume(config.settings.get("volume", DEFAULT_MUSIC_VOLUME))
         self.refresh_tracks()
         self.window = None
         self.lyric_overlay = None
+        self._closing = False
+        # 隐藏式播放标记（歌手/闹钟模式）：不属于「音乐播放器开启」，
+        # 因此不会触发系统托盘的播放控制条。
+        self._alarm_mode = False
+        self._singer_show_active = False
 
     def _apply_default_audio_output(self):
         device = QMediaDevices.defaultAudioOutput()
@@ -2277,7 +2909,7 @@ class MusicPlayer:
         self.audio.setVolume(0 if getattr(self, "_muted", False) else getattr(self, "_volume", DEFAULT_MUSIC_VOLUME) / 100.0)
 
     def _apply_player_loops(self):
-        loops = QMediaPlayer.Loops.Infinite if self._alarm_mode or self.loop == 1 else QMediaPlayer.Loops.Once
+        loops = QMediaPlayer.Loops.Infinite if self.loop == 1 else QMediaPlayer.Loops.Once
         self.player.setLoops(loops)
 
     def _replay_current_source(self):
@@ -2313,6 +2945,28 @@ class MusicPlayer:
         if self.lyric_overlay and self.lyric_overlay.isVisible():
             self.lyric_overlay.sync()
 
+    def force_refresh_lyric_render(self):
+        pos = self.player.position()
+        text, progress = self.lyric_display(pos)
+        if self.window and hasattr(self.window, "lyric"):
+            self.window.lyric.setText(self.lyric_text(pos))
+            self.window.lyric.update()
+        if self.lyric_overlay:
+            self.lyric_overlay.lyric.set_text(text, progress)
+            self.lyric_overlay.lyric.update()
+
+    def shift_current_lyric(self, delta_ms: int) -> bool:
+        path = self.player.source().toLocalFile()
+        if not path and 0 <= self.index < len(self.tracks):
+            path = self.tracks[self.index]
+        if not path:
+            return False
+        if not lyrics.shift_lyric_file(path, delta_ms):
+            return False
+        self._lyric_cache.pop(path, None)
+        self.force_refresh_lyric_render()
+        return True
+
     def refresh_tracks(self):
         current = self.player.source().toLocalFile()
         old_index_path = self.tracks[self.index] if 0 <= self.index < len(self.tracks) else ""
@@ -2331,13 +2985,19 @@ class MusicPlayer:
                 continue
             if key[0]:
                 cache_keys.add(key)
-        self.tracks = self._deduped_track_paths(assets.list_music_files() + music_api.list_cached_files())
+        all_tracks = self._deduped_track_paths(assets.list_music_files() + music_api.list_cached_files())
+        self._cleanup_favorites(all_tracks)
+        if self.favorite_mode:
+            all_tracks = [path for path in all_tracks if self.is_favorite_track(path)]
+        self.tracks = self._sorted_tracks(all_tracks)
+        self._warm_covers()
         live = set(self.tracks)
         self._duration_cache = {p: d for p, d in self._duration_cache.items() if p in live}
         for p in self.tracks:
             self._duration_cache.setdefault(p, _parse_duration(p))
-            lyrics.ensure_lyrics_async(p, self._duration_cache.get(p))
-            self._ensure_cover(p)
+        if current in live:
+            lyrics.ensure_lyrics_async(current, self._duration_cache.get(current))
+            self._ensure_cover(current)
         if not self.tracks:
             self.index = 0
         elif current in live:
@@ -2359,13 +3019,184 @@ class MusicPlayer:
             out.append(path)
         return out
 
+    def _sorted_tracks(self, tracks):
+        sort_mode = _playlist_sort_mode()
+        play_counts = config.settings.get("trackPlayCounts", {}) or {}
+        def created_key(path):
+            if self.favorite_mode:
+                value = self._favorite_tracks().get(self._track_key(path), 0)
+                try:
+                    return int(value or 0)
+                except (TypeError, ValueError):
+                    return 0
+            cached = music_api.cache_info(path) or {}
+            if cached.get("created"):
+                return int(cached.get("created") or 0)
+            try:
+                return int(os.path.getmtime(path))
+            except OSError:
+                return 0
+
+        def title_key(path):
+            return _track_sort_title(path)
+
+        def artist_key(path):
+            return _track_sort_artist(path)
+
+        def play_key(path):
+            return int(play_counts.get(os.path.normcase(os.path.abspath(path)), 0) or 0)
+
+        if sort_mode == "added":
+            return sorted(tracks, key=lambda p: (-created_key(p), title_key(p), p))
+        if sort_mode == "title_desc":
+            return sorted(tracks, key=lambda p: (_sort_text_key_desc(title_key(p)), p))
+        if sort_mode == "artist_asc":
+            return sorted(tracks, key=lambda p: (_sort_text_key(artist_key(p)), _sort_text_key(title_key(p)), p))
+        if sort_mode == "artist_desc":
+            return sorted(tracks, key=lambda p: (_sort_text_key_desc(artist_key(p)), _sort_text_key(title_key(p)), p))
+        if sort_mode == "plays":
+            return sorted(tracks, key=lambda p: (-play_key(p), _sort_text_key(title_key(p)), p))
+        return sorted(tracks, key=lambda p: (_sort_text_key(title_key(p)), p))
+
+    @staticmethod
+    def _track_key(path):
+        return os.path.normcase(os.path.abspath(path)) if path else ""
+
+    def _favorite_tracks(self):
+        favorites = config.settings.get("favoriteTracks", {}) or {}
+        return favorites if isinstance(favorites, dict) else {}
+
+    def is_favorite_track(self, path):
+        return bool(self._favorite_tracks().get(self._track_key(path)))
+
+    def _cleanup_favorites(self, live_tracks):
+        live = {self._track_key(path) for path in live_tracks}
+        favorites = dict(self._favorite_tracks())
+        cleaned = {key: value for key, value in favorites.items() if key in live}
+        if cleaned != favorites:
+            config.settings.set("favoriteTracks", cleaned, save=True)
+
+    def add_favorite_track(self, path, announce=True, sync_ui=True):
+        if not path or not os.path.exists(path):
+            return False
+        favorites = dict(self._favorite_tracks())
+        key = self._track_key(path)
+        if key not in favorites:
+            import time
+            favorites[key] = int(time.time())
+            config.settings.set("favoriteTracks", favorites, save=True)
+        if announce:
+            say(tr("已添加到我喜欢"))
+        if sync_ui and self.window:
+            # 搜索进行中：仅写入收藏数据、不重建播放列表，避免滚动位置被重置、打断浏览；
+            # 最终列表将在用户清空搜索框时由 _on_search_changed 统一重渲染。
+            if getattr(self.window, "_search_query", ""):
+                pass
+            else:
+                self.window.sync()
+        return True
+
+    def remove_favorite_track(self, path):
+        current = self.player.source().toLocalFile()
+        was_current = bool(current and path and os.path.abspath(current) == os.path.abspath(path))
+        favorites = dict(self._favorite_tracks())
+        key = self._track_key(path)
+        if key in favorites:
+            favorites.pop(key, None)
+            config.settings.set("favoriteTracks", favorites, save=True)
+        self.refresh_tracks()
+        if self.favorite_mode and was_current:
+            if self.tracks:
+                self.index = max(0, min(self.index, len(self.tracks) - 1))
+                self.play(self.tracks[self.index])
+            else:
+                self.index = 0
+                self.player.stop()
+                self.player.setSource(QUrl())
+        if self.window:
+            # 搜索进行中：仅写入数据、不重建播放列表，避免滚动位置被重置（与 add_favorite_track 一致）
+            if getattr(self.window, "_search_query", ""):
+                pass
+            else:
+                self.window.sync()
+        say(tr("已取消我喜欢"))
+
+    def toggle_favorite_mode(self):
+        self.favorite_mode = not self.favorite_mode
+        self.refresh_tracks()
+        if self.favorite_mode:
+            if self.tracks:
+                self.index = max(0, min(self.index, len(self.tracks) - 1))
+                self.play(self.tracks[self.index])
+            else:
+                self.index = 0
+                self.player.stop()
+                self.player.setSource(QUrl())
+                if self.window:
+                    self.window.refresh_display()
+        else:
+            current = self.player.source().toLocalFile()
+            if current in self.tracks:
+                self.index = self.tracks.index(current)
+        if self.window:
+            if not self.window._expanded:
+                self.window.toggle_playlist()
+            self.window.sync()
+
+    def _bump_play_count(self, path, persist=True):
+        if not path:
+            return
+        key = os.path.normcase(os.path.abspath(path))
+        counts = dict(config.settings.get("trackPlayCounts", {}) or {})
+        counts[key] = int(counts.get(key, 0) or 0) + 1
+        config.settings.set("trackPlayCounts", counts, save=persist)
+
     def _ensure_cover(self, path):
         title, artist = _split_track_artist(path)
-        covers.ensure_cover_async(title, artist or None, lambda _p: QTimer.singleShot(0, self._cover_ready))
+        # 立即复用已知封面（内存缓存或磁盘已存在），避免播放初期的空白等待；
+        # 即使后台查找尚未返回，也能先显示上一次已找到的封面。
+        known = self._cover_by_path.get(path) or covers.existing_cover(title, artist or None)
+        if known and self.window:
+            self.window.cover.set_album_art(known)
+            self.window.cover.update()
+        def on_done(saved_path):
+            QTimer.singleShot(0, lambda p=path, s=saved_path: self._cover_ready(p, s))
 
-    def _cover_ready(self):
-        if self.window:
-            self.window.sync()
+        covers.ensure_cover_async(title, artist or None, on_done)
+
+    def _warm_covers(self):
+        # 列表加载完成后后台预取封面（covers 内部信号量限流，最多 8 并发）。
+        # 这样用户在点击播放前，多数曲目封面已落盘，达成“极短时间即就绪”。
+        if not self.tracks:
+            return
+        for path in self.tracks[:50]:
+            title, artist = _split_track_artist(path)
+            covers.ensure_cover_async(title, artist or None)
+
+    def _prefetch_neighbors(self):
+        # 顺序播放时，提前为下一首拉取封面与歌词，确保切歌瞬间即就绪。
+        # 单曲循环无意义，随机模式无法预知下一首，故仅顺序模式预取。
+        if self.loop != 0 or len(self.tracks) < 2:
+            return
+        nxt = (self.index + 1) % len(self.tracks)
+        if nxt == self.index:
+            return
+        path = self.tracks[nxt]
+        self._ensure_cover(path)
+        if not lyrics.has_lyrics(path):
+            lyrics.ensure_lyrics_async(path, self.duration_text(path))
+
+    def _cover_ready(self, path, saved_path):
+        # 始终记录已找到的封面，即使此时已切歌也不丢弃；
+        # 下次该曲成为当前曲目时会通过 _ensure_cover 瞬时复用。
+        self._cover_by_path[path] = saved_path
+        if not self.window:
+            return
+        current = self.player.source().toLocalFile()
+        if os.path.normcase(os.path.abspath(current)) != os.path.normcase(os.path.abspath(path)):
+            return
+        self.window.cover.set_album_art(saved_path)
+        self.window.cover.update()
 
     def duration_text(self, path):
         if not path:
@@ -2443,31 +3274,56 @@ class MusicPlayer:
         threading.Thread(target=worker, daemon=True).start()
 
     def _download_remote_to(self, item, br, folder, cache=False):
-        existing = self._find_existing_track(item)
-        cache_path = (item or {}).get("cache_path")
-        moving_cache_to_library = (
-            not cache and cache_path and existing and
-            os.path.abspath(existing) == os.path.abspath(cache_path)
-        )
-        if existing and not moving_cache_to_library:
-            raise DuplicateTrackError("歌曲已存在")
-        info = music_api.full_url(item, br) if br else music_api.best_url(item, full_only=True)
-        if not info or not info.get("url"):
-            raise RuntimeError("无法获取完整版直链")
-        ext = info.get("format") or "mp3"
-        out_path = music_api.target_path(item, folder, ext, include_rid=cache)
-        music_api.download(info["url"], out_path)
-        lrc = music_api.get_lrc(item.get("rid", ""), item.get("source"), item.get("api"))
-        if lrc:
-            lyric_target = lyrics.lyric_path(out_path)
-            os.makedirs(os.path.dirname(lyric_target), exist_ok=True)
-            with open(lyric_target, "w", encoding="utf-8") as f:
-                f.write(lyrics.simplified_text(lrc))
-        music_api.remember_track(out_path, item, info)
-        payload = {"path": out_path, "item": item, "quality": info}
-        if not cache and cache_path and music_api.is_cache_path(cache_path):
-            payload["remove_cache_path"] = cache_path
-        return payload
+        # Serialize remote transfers: target selection, file creation, lyrics, and
+        # cache metadata must form one transaction when users click rapidly.
+        with self._remote_download_lock:
+            existing = self._find_existing_track(item)
+            cache_path = (item or {}).get("cache_path")
+            moving_cache_to_library = (
+                not cache and cache_path and existing and
+                os.path.abspath(existing) == os.path.abspath(cache_path)
+            )
+            if existing and not moving_cache_to_library:
+                raise DuplicateTrackError("歌曲已存在")
+            result = music_api.resolve_playable(item, br)
+            if result.get("error"):
+                raise music_api.RemoteResolveError(result["error"])
+            info = {k: v for k, v in result.items() if k != "error"}
+            ext = info.get("format") or "mp3"
+            out_path = music_api.target_path(item, folder, ext, include_rid=cache)
+            music_api.download(info["url"], out_path)
+            # Kuwo serves a short spoken "use the mobile app" clip (instead of the
+            # song) for restricted IPs/networks. It arrives as a normal 200 + url,
+            # so is_full_track can't catch it -- the user would hear Kuwo's own
+            # "当前音乐仅在..." message. Detect the tiny clip and surface our own
+            # restricted wording instead of playing the misleading audio.
+            if music_api.looks_like_trial_clip(out_path, item, info):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+                raise music_api.RemoteResolveError("restricted")
+            lrc = music_api.get_lrc(item.get("rid", ""), item.get("source"), item.get("api"))
+            if lrc:
+                lyric_target = lyrics.lyric_path(out_path)
+                os.makedirs(os.path.dirname(lyric_target), exist_ok=True)
+                lyric_temp = lyric_target + ".tmp"
+                try:
+                    with open(lyric_temp, "w", encoding="utf-8") as f:
+                        f.write(lyrics.simplified_text(lrc))
+                    os.replace(lyric_temp, lyric_target)
+                except Exception:
+                    try:
+                        if os.path.exists(lyric_temp):
+                            os.remove(lyric_temp)
+                    except OSError:
+                        pass
+                    raise
+            music_api.remember_track(out_path, item, info)
+            payload = {"path": out_path, "item": item, "quality": info}
+            if not cache and cache_path and music_api.is_cache_path(cache_path):
+                payload["remove_cache_path"] = cache_path
+            return payload
 
     def _find_existing_track(self, item):
         key = _remote_dedupe_key(item or {})
@@ -2478,17 +3334,11 @@ class MusicPlayer:
                 return path
         return ""
 
-    def _has_any_track(self, item):
-        return bool(self._find_existing_track(item))
-
-    def _has_local_track(self, item):
-        key = _remote_dedupe_key(item or {})
-        if not key[0]:
-            return False
-        for path in assets.list_music_files():
-            if _track_dedupe_key(path) == key:
-                return True
-        return False
+    # 注：原先的 _has_any_track / _has_local_track 预检已移除。
+    # 它们会在「主线程」全量扫描本地曲库 + 缓存目录做去重，用户连续点击下载 /
+    # 加入播放列表时主线程被反复扫描占满，正是列表滑动卡顿的主因。
+    # 后台 _download_remote_to 取得下载锁后第一步就会做等价去重（DuplicateTrackError），
+    # 重复歌曲仍会以「歌曲已存在」播报，用户可见行为一致，但不再阻塞 UI。
 
     def play_remote(self, item):
         if not item or not self.window:
@@ -2508,6 +3358,8 @@ class MusicPlayer:
             try:
                 payload = self._download_remote_to(item, None, music_api.cache_dir(), cache=True)
                 self.window.remotePlayReady.emit(payload, None)
+            except music_api.RemoteResolveError as exc:
+                self.window.remotePlayReady.emit(None, exc.kind)
             except Exception as exc:  # noqa: BLE001
                 self.window.remotePlayReady.emit(None, str(exc))
             finally:
@@ -2518,15 +3370,16 @@ class MusicPlayer:
     def cache_remote(self, item):
         if not item or not self.window:
             return
-        if self._has_any_track(item):
-            say(tr("歌曲已存在"))
-            return
+        # 去重不再于主线程预检：后台 _download_remote_to 持锁后会先做等价去重，
+        # 重复时抛 DuplicateTrackError，仍会播报「歌曲已存在」（见 _on_remote_download_ready）。
         say(tr("正在添加到播放列表"))
 
         def worker():
             try:
                 payload = self._download_remote_to(item, None, music_api.cache_dir(), cache=True)
                 self.window.remoteDownloadReady.emit(payload, None)
+            except music_api.RemoteResolveError as exc:
+                self.window.remoteDownloadReady.emit(None, exc.kind)
             except Exception as exc:  # noqa: BLE001
                 self.window.remoteDownloadReady.emit(None, str(exc))
 
@@ -2535,39 +3388,126 @@ class MusicPlayer:
     def download_remote(self, item, br):
         if not item or not self.window:
             return
-        if self._has_local_track(item):
-            say(tr("歌曲已存在"))
-            return
+        # 同上：去掉主线程全量扫描预检，去重交由后台 _download_remote_to 处理。
         say(tr("开始下载"))
 
         def worker():
             try:
-                payload = self._download_remote_to(item, br, assets.get_music_folder(), cache=False)
+                payload = self._download_remote_to(item, br, assets.get_library_folder(), cache=False)
                 self.window.remoteDownloadReady.emit(payload, None)
             except DuplicateTrackError as exc:
                 self.window.remoteDownloadReady.emit(None, str(exc))
+            except music_api.RemoteResolveError as exc:
+                self.window.remoteDownloadReady.emit(None, exc.kind)
             except Exception as exc:  # noqa: BLE001
                 self.window.remoteDownloadReady.emit(None, str(exc))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def play_cached(self, payload):
+    def favorite_remote(self, item):
+        if not item or not self.window:
+            return
+        existing = self._find_existing_track(item)
+        if existing and os.path.exists(existing) and not music_api.is_cache_path(existing):
+            self.add_favorite_track(existing)
+            return
+        item = dict(item or {})
+        if existing and music_api.is_cache_path(existing):
+            item["cache_path"] = existing
+        say(tr("开始下载"))
+
+        def worker():
+            try:
+                payload = self._download_remote_to(item, None, assets.get_library_folder(), cache=False)
+                payload["add_favorite"] = True
+                self.window.remoteDownloadReady.emit(payload, None)
+            except DuplicateTrackError:
+                existing_path = self._find_existing_track(item)
+                if existing_path:
+                    self.window.remoteDownloadReady.emit({"path": existing_path, "add_favorite": True}, None)
+                else:
+                    self.window.remoteDownloadReady.emit(None, "歌曲已存在")
+            except Exception as exc:  # noqa: BLE001
+                self.window.remoteDownloadReady.emit(None, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def favorite_cached(self, path):
+        """将缓存歌曲收藏并落地到本地曲库；与在线收藏一致，均播报「已添加到我喜欢」。"""
+        if not path:
+            return
+        # 非缓存来源退回原逻辑（保留语音播报）
+        if not music_api.is_cache_path(path):
+            self.add_favorite_track(path)
+            return
+        info = music_api.cache_info(path) or {}
+        parsed_title, parsed_artist = music_api._split_track_artist_from_name(path)
+        name = (info.get("name") or "").strip() or parsed_title
+        artist = (info.get("artist") or "").strip() or parsed_artist
+        item = {
+            "name": name, "artist": artist,
+            "rid": info.get("rid") or info.get("id") or "",
+            "id": info.get("rid") or info.get("id") or "",
+            "source": info.get("source", ""), "api": info.get("api", ""),
+            "cover": info.get("cover", ""), "duration": info.get("duration", 0),
+            "full_qualities": info.get("full_qualities", []),
+        }
+        # 曲库已有同名本地副本时，直接收藏该副本，避免重复落地
+        existing = self._find_existing_track(item)
+        if existing and os.path.exists(existing) and not music_api.is_cache_path(existing):
+            self.add_favorite_track(existing, announce=True)
+            return
+        library_folder = assets.get_library_folder()
+        ext = (os.path.splitext(path)[1].lstrip(".") or "mp3")
+        target = music_api.target_path(item, library_folder, ext, include_rid=False)
+        try:
+            shutil.copy2(path, target)
+        except OSError:
+            # 落地失败则退化为仅收藏缓存路径（仍播报）
+            self.add_favorite_track(path, announce=True)
+            return
+        self._promote_cached_sidecars(path, target)
+        music_api.remember_track(target, item, info.get("quality"))
+        self.refresh_tracks()
+        self.add_favorite_track(target, announce=True)
+
+    def _promote_cached_sidecars(self, src, dst):
+        """把缓存歌曲的歌词等附件一并拷贝到本地曲库目录。"""
+        try:
+            from app.core import lyrics
+            for lp in (lyrics.lyric_path(src), lyrics.plain_lyric_path(src)):
+                if lp and os.path.exists(lp):
+                    try:
+                        shutil.copy2(lp, lyrics.lyric_path(dst))
+                    except OSError:
+                        pass
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+
+    def play_cached(self, payload, sync_ui=True):
         path = (payload or {}).get("path")
         self.refresh_tracks()
         if path in self.tracks:
             self.index = self.tracks.index(path)
         self.play(path)
-        if self.window:
+        # 搜索进行中默认不重建列表，避免单/双击缓存完成即跳回顶部、打断浏览；
+        # 仅当非搜索态或显式要求时同步整个界面。
+        if self.window and sync_ui and not getattr(self.window, "_search_query", ""):
             self.window.sync()
 
     def save_as_track(self, i):
         self.refresh_tracks()
         if not (0 <= i < len(self.tracks)):
             return
-        src = self.tracks[i]
+        self.save_as_track_path(self.tracks[i])
+
+    def save_as_track_path(self, src):
+        if not src:
+            return
         title = _track_display_title(src).replace(" · 缓存", "")
         ext = os.path.splitext(src)[1] or ".mp3"
-        target, _ = QFileDialog.getSaveFileName(None, tr("另存为"), f"{title}{ext}", "音频文件 (*.*)")
+        target, _ = QFileDialog.getSaveFileName(None, tr("另存为"), f"{title}{ext}", f"{tr('音频文件')} (*.*)")
         if not target:
             return
         try:
@@ -2576,34 +3516,40 @@ class MusicPlayer:
         except OSError:
             say(tr("保存失败，请稍后再试"))
 
-    def delete_track(self, i):
-        self.refresh_tracks()
-        if not (0 <= i < len(self.tracks)):
-            if self.window:
-                self.window.sync()
-            return
-        path = self.tracks[i]
-        if not self.delete_track_path(path, remove_sidecars=True):
-            if self.window:
-                self.window.sync()
-            return
-        if i <= self.index and self.index > 0:
-            self.index -= 1
-        self.refresh_tracks()
-        if self.window:
-            self.window.sync()
+    def _wait_media_released(self, timeout_ms=1500):
+        """主动等待 QMediaPlayer 释放当前媒体文件句柄。
+
+        Windows WMF 后端在 stop()/setSource(QUrl()) 后不会立即释放文件句柄，
+        若不等待就删除会出现「正被另一进程使用」而失败。轮询媒体状态直到
+        NoMedia/InvalidMedia（或超时），避免随后删除被占用文件。
+        """
+        from PyQt6.QtCore import QElapsedTimer
+        from PyQt6.QtMultimedia import QMediaPlayer
+
+        timer = QElapsedTimer()
+        timer.start()
+        while timer.elapsed() < timeout_ms:
+            QApplication.processEvents()
+            try:
+                status = self.player.mediaStatus()
+            except Exception:
+                return True
+            if status in (QMediaPlayer.MediaStatus.NoMedia,
+                          QMediaPlayer.MediaStatus.InvalidMedia):
+                return True
+            QThread.msleep(30)
+        return True
 
     def delete_track_path(self, path, remove_sidecars=True):
         if not path:
             return True
         cached_info = music_api.cache_info(path) or {}
         current = self.player.source().toLocalFile()
-        if os.path.abspath(current) == os.path.abspath(path):
+        if current and os.path.abspath(current) == os.path.abspath(path):
             self.player.stop()
             self.player.setSource(QUrl())
-            for _ in range(6):
-                QApplication.processEvents()
-                QThread.msleep(35)
+            # 等待媒体资源真正释放，避免 Windows 下删除被占用文件失败
+            self._wait_media_released(timeout_ms=1500)
         ok = self._delete_audio_file(path)
         if not ok:
             return False
@@ -2611,18 +3557,49 @@ class MusicPlayer:
         self._lyric_cache.pop(path, None)
         if remove_sidecars:
             self._delete_track_sidecars(path, cached_info)
-        music_api.forget_cache(path)
+        # 缓存索引写入为非关键操作，失败不应影响本次删除结果
+        try:
+            music_api.forget_cache(path)
+        except Exception:
+            pass
         return True
 
-    def _delete_audio_file(self, path):
-        for _ in range(10):
+    def delete_track_path_and_sync(self, path, remove_sidecars=True):
+        current = self.player.source().toLocalFile()
+        was_current = bool(current) and os.path.abspath(current) == os.path.abspath(path)
+        try:
+            deleted = self.delete_track_path(path, remove_sidecars=remove_sidecars)
+        except Exception:
+            deleted = False
+        if not deleted:
+            # 删除未成功也要回写 UI，避免行残留
+            if self.window:
+                self.window.sync()
+            return False
+        try:
+            self.refresh_tracks()
+        except Exception:
+            # refresh_tracks 内部偶发异常（如缓存索引写入失败）不应阻断渲染
+            pass
+        # 删除的是正在播放的曲目：立即推进到下一首，保证播放连贯
+        if was_current and self.tracks:
+            self.index = max(0, min(self.index, len(self.tracks) - 1))
+            self.play(self.tracks[self.index])
+        if self.window:
+            self.window.sync()
+        return True
+
+    def _delete_audio_file(self, path, attempts=24, initial_ms=50, max_ms=250):
+        delay = initial_ms
+        for _ in range(attempts):
             try:
                 if os.path.exists(path):
                     os.remove(path)
                 return True
             except OSError:
                 QApplication.processEvents()
-                QThread.msleep(50)
+                QThread.msleep(delay)
+                delay = min(delay * 2, max_ms)
         return not os.path.exists(path)
 
     def _delete_track_sidecars(self, path, cached_info=None):
@@ -2680,32 +3657,21 @@ class MusicPlayer:
         self._muted = not self._muted
         self.audio.setVolume(0 if self._muted else self._volume / 100.0)
         if self.window:
-            self.window.sync()
+            self.window._sync_volume_icon(0 if self._muted else self._volume)
 
     def play(self, path):
         if not path or not os.path.exists(path):
             return
-        self._alarm_mode = False
         self._apply_player_loops()
         self.player.setSource(QUrl.fromLocalFile(path))
         self._apply_player_loops()
         self._apply_default_audio_output()
         self.player.play()
+        self._bump_play_count(path)
+        self._ensure_cover(path)
+        self._prefetch_neighbors()
         if self.window:
-            self.window.sync()
-
-    def play_alarm(self, path):
-        """隐藏播放器播放闹钟铃声，并在单曲结束后自动循环。"""
-        if not path or not os.path.exists(path):
-            return
-        if self.window:
-            self.window.hide()
-        self._alarm_mode = True
-        self._apply_player_loops()
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self._apply_player_loops()
-        self._apply_default_audio_output()
-        self.player.play()
+            self.window.refresh_display()
 
     def toggle_play(self):
         if self.player.isPlaying():
@@ -2717,7 +3683,13 @@ class MusicPlayer:
                 self._apply_default_audio_output()
                 self.player.play()
         if self.window:
-            self.window.sync()
+            self.window.refresh_display()
+
+    def pause_for_drop(self):
+        if self.player.isPlaying():
+            self.player.pause()
+        if self.window:
+            self.window.refresh_display()
 
     def seek_relative(self, delta_ms):
         if self.player.source().isEmpty():
@@ -2729,7 +3701,7 @@ class MusicPlayer:
             target = min(duration, target)
         self.player.setPosition(target)
         if self.window:
-            self.window.sync()
+            self.window.refresh_display()
         self.sync_lyric_overlay()
 
     def play_index(self, i):
@@ -2737,7 +3709,7 @@ class MusicPlayer:
             self.index = i
             self.play(self.tracks[i])
             if self.window:
-                self.window.sync()
+                self.window.refresh_display()
 
     def _pick_random_index(self):
         if not self.tracks:
@@ -2759,7 +3731,7 @@ class MusicPlayer:
             self.index = (self.index + 1) % len(self.tracks)
             self.play(self.tracks[self.index])
         if self.window:
-            self.window.sync()
+            self.window.refresh_display()
 
     def prev(self):
         if not self.tracks:
@@ -2773,103 +3745,42 @@ class MusicPlayer:
             self.index = (self.index - 1) % len(self.tracks)
             self.play(self.tracks[self.index])
         if self.window:
-            self.window.sync()
+            self.window.refresh_display()
 
     def cycle_loop(self):
         self.loop = (self.loop + 1) % 3
         self._apply_player_loops()
         if self.window:
-            self.window.sync()
+            self.window.loop_b.kind = ["loop", "loop_one", "shuffle"][self.loop]
+            self.window.loop_b.update()
         self.sync_lyric_overlay()
 
     def _on_status(self, status):
         from PyQt6.QtMultimedia import QMediaPlayer
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             if self._singer_show_active:
+                # 歌手隐藏式演唱结束：停止并播报收尾语，不自动切歌。
                 self._singer_show_active = False
                 self.player.stop()
-                QTimer.singleShot(180, self._speak_singer_outro)
+                self.player.setSource(QUrl())
+                say(tr("还想听吗？那就快去听听歌吧！"))
                 return
-            if self._alarm_mode or self.loop == 1:
+            if self._alarm_mode:
+                # 闹钟铃声单曲循环，直到 stop_alarm。
                 QTimer.singleShot(0, self._replay_current_source)
                 return
+            if self.loop == 1:
+                QTimer.singleShot(0, self._replay_current_source)
             else:
-                self.next()
-
-    def start_singer_show(self):
-        self.refresh_tracks()
-        self._singer_timer.stop()
-        self._alarm_mode = False
-        local_tracks = assets.list_music_files()
-        if local_tracks:
-            self._start_singer_track(random.choice(local_tracks))
-            return
-
-        def worker():
-            try:
-                item = self._find_kaitianchuang_item()
-                if not item:
-                    raise RuntimeError("无法找到开天窗")
-                existing = self._find_existing_track(item)
-                if existing:
-                    self._signals.singerTrackReady.emit(existing, None)
-                    return
-                payload = self._download_remote_to(item, None, music_api.cache_dir(), cache=True)
-                self._signals.singerTrackReady.emit(payload.get("path"), None)
-            except Exception as exc:  # noqa: BLE001
-                self._signals.singerTrackReady.emit(None, str(exc))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _find_kaitianchuang_item(self):
-        for query in ("开天窗 五月天", "五月天 开天窗"):
-            for item in music_api.search_full(query, page=0, size=8, candidates=16):
-                title = _dedupe_text(item.get("name"))
-                artist = _dedupe_text(item.get("artist"))
-                if "开天窗" in title and "五月天" in artist:
-                    return item
-        return None
-
-    def _on_singer_track_ready(self, path, error):
-        if error or not path:
-            say(tr("当前没有可播放的音乐，请先上传"))
-            return
-        self._start_singer_track(path)
-
-    def _start_singer_track(self, path):
-        if not path or not os.path.exists(path):
-            say(tr("当前没有可播放的音乐，请先上传"))
-            return
-        self._singer_show_started_visible = bool(self.window and self.window.isVisible())
-        say(tr("歌手小PP登场捏~"))
-        self._singer_show_active = True
-        self.play(path)
-        self.player.setLoops(QMediaPlayer.Loops.Once)
-
-    def _speak_singer_outro(self):
-        spoken = on_spoken(self._signals.singerOutroFinished.emit)
-        if not say(tr("还想听吗？那就快去听听歌吧！")):
-            self._close_after_singer_outro()
-        elif not spoken:
-            QTimer.singleShot(2600, self._close_after_singer_outro)
-
-    def _close_after_singer_outro(self):
-        self._singer_timer.stop()
-        self._singer_show_active = False
-        self._alarm_mode = False
-        self._apply_player_loops()
-        self.player.stop()
-        self.player.setSource(QUrl())
-        if self.window:
-            if not self._singer_show_started_visible:
-                self.window.hide()
-            self.window.sync()
-        if self.lyric_overlay and not self._singer_show_started_visible:
-            self.lyric_overlay.hide()
-        self._singer_show_started_visible = False
+                # Advance through the playlist; modulo in next() wraps the
+                # last track back to the first one.
+                QTimer.singleShot(0, self.next)
 
     def play_random(self, duration=None, show_player=True):
         self.refresh_tracks()
+        # 进入可见播放会话：清除任何隐藏式（歌手/闹钟）标记。
+        self._alarm_mode = False
+        self._singer_show_active = False
         if show_player:
             self.reset_player_volume()
             w = self.ensure_window()
@@ -2886,6 +3797,8 @@ class MusicPlayer:
             w.raise_()
             w.activateWindow()
             w.sync()
+            # 通知托盘：音乐播放器已开启，显示播放控制条。
+            self._notify_tray(True)
         if not self.tracks:
             say(tr("当前没有可播放的音乐，请先上传"))
             return
@@ -2893,35 +3806,78 @@ class MusicPlayer:
         self.play(self.tracks[self.index])
         if show_player and self.window:
             self.window.sync()
-        else:
-            self._singer_timer.start(duration or 30000)
+
+    def stop(self):
+        self._apply_player_loops()
+        self.player.stop()
+        self.player.setSource(QUrl())
+
+    def close_player(self):
+        """关闭播放器会话：仅隐藏窗口并停止播放，不退出整个 AT小PP 应用。
+
+        卜卜音悦原版会在此处调用 app.quit()（因为其播放器即整个应用）；
+        AT小PP 中播放器只是桌宠的一个面板，关闭它不应结束整个程序。
+        """
+        self._alarm_mode = False
+        self._singer_show_active = False
+        self.stop()
+        if self.window:
+            self.window.hide()
+        if self.lyric_overlay:
+            self.lyric_overlay.hide()
+        self._notify_tray(False)
+
+    def _notify_tray(self, visible):
+        """通知系统托盘显示/隐藏音乐播放控制条（仅播放器窗口开启时显示）。"""
+        tray = getattr(self.ctx, "tray", None)
+        if tray is not None and hasattr(tray, "set_music_visible"):
+            tray.set_music_visible(bool(visible))
+
+    # ---- 兼容层：歌手 / 闹钟 隐藏式播放 ----
+    # 卜卜音悦移植版移除了这些方法（其无歌手/闹钟概念），但 AT小PP 的
+    # 场景系统与闹钟提醒仍依赖它们。它们复用同一个 QMediaPlayer，且不打开
+    # 播放器窗口，因此不会触发托盘播放控制条（符合「隐藏式播放器不算」）。
+    def play_alarm(self, path):
+        """隐藏播放闹钟铃声（单曲循环，直到 stop_alarm）。"""
+        if not path or not os.path.exists(path):
+            return
+        if self.window:
+            self.window.hide()
+        self._singer_show_active = False
+        self._alarm_mode = True
+        self.player.setLoops(QMediaPlayer.Loops.Once)
+        self._apply_default_audio_output()
+        self.player.setSource(QUrl.fromLocalFile(path))
+        self.player.play()
+
+    def start_singer_show(self):
+        """隐藏式歌手演唱：随机播放一首本地曲目（不打开播放器窗口）。"""
+        self.refresh_tracks()
+        local_tracks = assets.list_music_files()
+        if not local_tracks:
+            say(tr("当前没有可播放的音乐，请先上传"))
+            return
+        say(tr("歌手小PP登场捏~"))
+        path = random.choice(local_tracks)
+        self._alarm_mode = False
+        self.play(path)
+        self._singer_show_active = True
+        self.player.setLoops(QMediaPlayer.Loops.Once)
 
     def _stop_singer(self):
         self._singer_show_active = False
         self.player.stop()
         self.player.setSource(QUrl())
 
-    def stop(self):
-        self._singer_timer.stop()
-        self._singer_show_active = False
-        self._alarm_mode = False
-        self._apply_player_loops()
-        self.player.stop()
-        self.player.setSource(QUrl())
-
     def stop_alarm(self):
         if self._alarm_mode:
-            self.stop()
+            self._alarm_mode = False
+            self._apply_player_loops()
+            self.player.stop()
+            self.player.setSource(QUrl())
 
     def alarm_active(self):
         return self._alarm_mode
-
-    def close_player(self):
-        self.stop()
-        if self.window:
-            self.window.hide()
-        if self.lyric_overlay:
-            self.lyric_overlay.hide()
 
     def retranslate_ui(self):
         if self.window:
@@ -2930,15 +3886,14 @@ class MusicPlayer:
             self.lyric_overlay.retranslate_ui()
 
     def leave_activity(self):
-        """退出角色状态时停止隐藏短播，保留已打开的播放器窗口。"""
-        self._singer_timer.stop()
         if self.window is None or not self.window.isVisible():
             self.stop()
 
     def upload(self):
+        start_dir = assets.get_music_folder()
         files, _ = QFileDialog.getOpenFileNames(
-            None, tr("上传音乐"), "",
-            "音频文件 (*.mp3 *.wav *.ogg *.flac *.m4a)"
+            None, tr("上传音乐"), start_dir,
+            f"{tr('音频文件')} (*.mp3 *.wav *.ogg *.flac *.m4a)"
         )
         if files:
             self.add_files(files)
@@ -2952,7 +3907,7 @@ class MusicPlayer:
         """
         if not paths:
             return []
-        dest = assets.get_music_folder()
+        dest = assets.get_library_folder()
         imported = []
         for f in paths:
             if not f or not os.path.exists(f):

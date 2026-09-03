@@ -17,12 +17,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'Christopher Hsu'),
           StringStruct('FileDescription', 'AT小PP'),
-          StringStruct('FileVersion', 'beta version 1.0'),
+          StringStruct('FileVersion', '1.0'),
           StringStruct('InternalName', 'AT小PP'),
           StringStruct('LegalCopyright', 'Copyright © 2026 Christopher Hsu. All rights reserved.'),
           StringStruct('OriginalFilename', 'AT小PP.exe'),
           StringStruct('ProductName', 'AT小PP'),
-          StringStruct('ProductVersion', 'beta version 1.0')
+          StringStruct('ProductVersion', '1.0')
         ]
       )
     ]),

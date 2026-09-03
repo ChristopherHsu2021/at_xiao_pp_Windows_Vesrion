@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QLineEdit, QComboBox, QHBoxLayout,
     QVBoxLayout, QFileDialog, QCheckBox, QStackedWidget,
     QGraphicsDropShadowEffect, QApplication, QDialog,
+    QRadioButton, QButtonGroup,
 )
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 
@@ -228,6 +229,30 @@ QCheckBox::indicator:checked {
     background: #f97510;
     border-color: #f97510;
 }
+QRadioButton {
+    color: #6b5744;
+    font-size: 13px;
+    font-weight: 600;
+    spacing: 8px;
+    background: transparent;
+    min-height: 32px;
+    max-height: 32px;
+    padding: 6px 10px;
+}
+QRadioButton:hover {
+    color: #f97510;
+}
+QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1.5px solid rgba(160,142,122,0.35);
+    border-radius: 9px;
+    background: #ffffff;
+}
+QRadioButton::indicator:checked {
+    background: #f97510;
+    border-color: #f97510;
+}
 QWidget#installFooter {
     background: transparent;
     border-top: 1px solid rgba(249,117,16,0.12);
@@ -423,7 +448,7 @@ def write_custom_uninstall_registry(install_dir: str):
         quiet_cmd = uninstall_cmd
         values = {
             "DisplayName": APP_NAME,
-            "DisplayVersion": "beta version 1.0",
+            "DisplayVersion": "1.0",
             "Publisher": "Christopher Hsu",
             "DisplayIcon": exe,
             "UninstallString": uninstall_cmd,
@@ -970,11 +995,75 @@ class UninstallerWindow(QWidget):
 
     def _finish_uninstall(self):
         self._prepare_uninstall()
-        if self.run_inno_uninstaller:
-            schedule_inno_uninstall_cleanup(self.install_dir)
-        elif not self.inno_managed:
-            schedule_uninstall_cleanup()
+        # 最后一面点击后，立即以最高权限静默触发深度卸载脚本（隐藏运行，跑完自删）
+        self._trigger_deep_uninstall()
         QApplication.instance().exit(0)
+
+    def _trigger_deep_uninstall(self):
+        """从内嵌资源提取静默卸载脚本，以最高权限隐藏运行（深度卸载，跑完自删）。"""
+        try:
+            candidates = []
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(os.path.join(meipass, "uninstall_at_xiaopp.bat"))
+                candidates.append(os.path.join(meipass, "_internal", "uninstall_at_xiaopp.bat"))
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            candidates.append(os.path.join(exe_dir, "uninstall_at_xiaopp.bat"))
+            candidates.append(os.path.join(exe_dir, "_internal", "uninstall_at_xiaopp.bat"))
+            candidates.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "uninstall_at_xiaopp.bat")))
+            src = None
+            for c in candidates:
+                if os.path.exists(c):
+                    src = c
+                    break
+            if not src:
+                # 资源缺失时退回内置清理逻辑，避免卸载卡死
+                if self.run_inno_uninstaller:
+                    schedule_inno_uninstall_cleanup(self.install_dir)
+                elif not self.inno_managed:
+                    schedule_uninstall_cleanup()
+                return
+            # 同目录定位无窗口 launcher（wscript 是 GUI 子系统：runas 提权后无窗口、不在任务栏留按钮）
+            src_dir = os.path.dirname(src)
+            vbs_candidates = [os.path.join(src_dir, "uninstall_launcher.vbs")]
+            if meipass:
+                vbs_candidates.append(os.path.join(meipass, "uninstall_launcher.vbs"))
+                vbs_candidates.append(os.path.join(meipass, "_internal", "uninstall_launcher.vbs"))
+            vbs_candidates.append(os.path.join(exe_dir, "uninstall_launcher.vbs"))
+            vbs_candidates.append(os.path.join(exe_dir, "_internal", "uninstall_launcher.vbs"))
+            vbs_candidates.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "uninstall_launcher.vbs")))
+            vbs_src = None
+            for c in vbs_candidates:
+                if os.path.exists(c):
+                    vbs_src = c
+                    break
+            dst = os.path.join(tempfile.gettempdir(), "at_xiaopp_deep_uninstall.bat")
+            shutil.copyfile(src, dst)
+            dst_vbs = os.path.join(tempfile.gettempdir(), "at_xiaopp_deep_uninstall_launcher.vbs")
+            if vbs_src:
+                shutil.copyfile(vbs_src, dst_vbs)
+            # runas 提权 wscript（GUI，无窗口无任务栏按钮）；launcher 内部以 intWindowStyle=0 完全隐藏跑 bat。
+            # 直接 runas 一个 .bat 会在任务栏留一个隐藏的提权 cmd 图标（控制台子系统 + runas 的固有行为），
+            # 故改用 GUI 载体的 wscript 彻底消除该图标。仅当当前进程未提权时 runas 弹一次系统 UAC。
+            import ctypes
+            ws = r"C:\Windows\System32\wscript.exe"
+            if vbs_src:
+                params = f'"{dst_vbs}" "{dst}"'
+                rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", ws, params, None, 0)
+            else:
+                # 无 launcher 兜底：直接 runas 启动 bat（仍会有提权 cmd 任务栏图标，但保证能卸载）
+                rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", dst, "silent", None, 0)
+            if rc <= 32:
+                # UAC 被拒或启动失败 -> 回退内置清理，避免卸载卡死
+                if self.run_inno_uninstaller:
+                    schedule_inno_uninstall_cleanup(self.install_dir)
+                elif not self.inno_managed:
+                    schedule_uninstall_cleanup()
+        except Exception:  # noqa: BLE001
+            if self.run_inno_uninstaller:
+                schedule_inno_uninstall_cleanup(self.install_dir)
+            elif not self.inno_managed:
+                schedule_uninstall_cleanup()
 
     def _cancel_uninstall(self):
         QApplication.instance().exit(2)
@@ -1013,6 +1102,8 @@ class InstallerWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(444, 420)
         self.install_dir = self._default_dir()
+        self._upgrade_mode = None
+        self._show_upgrade_page = False
         self._drag_pos = None
         self._progress = 0
         self._progress_keys = ["正在解压资源文件", "正在写入应用组件", "正在创建快捷入口", "正在完成配置"]
@@ -1067,6 +1158,7 @@ class InstallerWindow(QWidget):
         self.stack = QStackedWidget(self.container)
         outer.addWidget(self.stack, 1)
         self._build_lang()
+        self._build_upgrade_mode()
         self._build_path()
         self._build_progress()
         self._build_success()
@@ -1090,7 +1182,7 @@ class InstallerWindow(QWidget):
         footer_lay.setSpacing(8)
         dots = QHBoxLayout()
         dots.setSpacing(6)
-        for i in range(4):
+        for i in range(5):
             dot = QWidget()
             dot.setObjectName("stepDotActive" if i == active_step else "stepDot")
             dot.setFixedSize(20 if i == active_step else 6, 6)
@@ -1138,12 +1230,108 @@ class InstallerWindow(QWidget):
         v.addStretch(1)
         self.next_b = QPushButton(tr("下一步"))
         self.next_b.setObjectName("primary")
-        self.next_b.clicked.connect(lambda: self._go(1))
+        self.next_b.clicked.connect(self._on_lang_next)
         footer.addWidget(self.next_b)
         self.stack.addWidget(w)
 
-    def _build_path(self):
+    def _build_upgrade_mode(self):
         w, v, footer = self._make_page(1)
+        v.addStretch(1)
+        self.upgrade_title, self.upgrade_sub = self._add_logo_header(
+            v,
+            tr("检测到已安装"),
+            tr("请选择本次安装方式"),
+        )
+        v.addSpacing(20)
+        self.upgrade_group = QButtonGroup(self)
+        self.upgrade_keep_rb = QRadioButton(tr("保留数据升级安装"))
+        self.upgrade_clean_rb = QRadioButton(tr("彻底清除重新安装"))
+        self.upgrade_keep_rb.setObjectName("upgradeOption")
+        self.upgrade_clean_rb.setObjectName("upgradeOption")
+        self.upgrade_keep_rb.setChecked(True)
+        self.upgrade_group.addButton(self.upgrade_keep_rb, 1)
+        self.upgrade_group.addButton(self.upgrade_clean_rb, 2)
+        self.upgrade_keep_rb.toggled.connect(self._update_upgrade_hint)
+        self.upgrade_clean_rb.toggled.connect(self._update_upgrade_hint)
+        v.addWidget(self.upgrade_keep_rb)
+        v.addSpacing(8)
+        v.addWidget(self.upgrade_clean_rb)
+
+        v.addSpacing(14)
+        self.upgrade_hint = QLabel("")
+        self.upgrade_hint.setObjectName("installSub")
+        self.upgrade_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.upgrade_hint.setWordWrap(True)
+        v.addWidget(self.upgrade_hint)
+        v.addStretch(1)
+
+        self.upgrade_back_b = QPushButton(tr("上一步"))
+        self.upgrade_next_b = QPushButton(tr("下一步"))
+        self.upgrade_next_b.setObjectName("primary")
+        self.upgrade_back_b.clicked.connect(lambda: self._go(0))
+        self.upgrade_next_b.clicked.connect(self._on_upgrade_next)
+        footer.addWidget(self.upgrade_back_b)
+        footer.addWidget(self.upgrade_next_b)
+        self.stack.addWidget(w)
+
+    def _is_already_installed(self) -> bool:
+        """检测系统是否已安装过 AT小PP：注册表卸载项 / 安装目录 exe / APPDATA 数据。"""
+        if os.name != "nt":
+            return os.path.isdir(_default_install_dir())
+        try:
+            import winreg
+        except ImportError:
+            winreg = None
+        if winreg is None:
+            return os.path.isdir(_default_install_dir())
+        # 注册表卸载项
+        uninstall_keys = [
+            ("HKLM", winreg.HKEY_LOCAL_MACHINE, UNINSTALL_REG_ROOT + "\\" + APP_NAME + "_is1"),
+            ("HKCU", winreg.HKEY_CURRENT_USER, UNINSTALL_REG_ROOT + "\\" + APP_NAME + "_is1"),
+        ]
+        try:
+            for _, hive, key_path in uninstall_keys:
+                try:
+                    key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ)
+                    winreg.CloseKey(key)
+                    return True
+                except FileNotFoundError:
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        # 安装目录已存在可执行文件
+        if os.path.exists(_installed_exe_path(_default_install_dir())):
+            return True
+        return False
+
+    def _on_lang_next(self):
+        if self._is_already_installed():
+            self._show_upgrade_page = True
+            self._update_upgrade_hint()
+            self._go(1)
+        else:
+            self._upgrade_mode = "keep"
+            self._show_upgrade_page = False
+            self._go(2)
+
+    def _update_upgrade_hint(self):
+        if self.upgrade_clean_rb.isChecked():
+            self.upgrade_hint.setText(tr("清除安装目录及全部用户数据后重新安装"))
+        else:
+            self.upgrade_hint.setText(tr("保留您的配置、收藏与缓存，仅更新程序文件"))
+
+    def _on_upgrade_next(self):
+        self._upgrade_mode = "clean" if self.upgrade_clean_rb.isChecked() else "keep"
+        self._go(2)
+
+    def _on_path_back(self):
+        if getattr(self, "_show_upgrade_page", False):
+            self._go(1)
+        else:
+            self._go(0)
+
+    def _build_path(self):
+        w, v, footer = self._make_page(2)
         v.addStretch(1)
         self.path_title, self.path_sub = self._add_logo_header(
             v,
@@ -1179,7 +1367,7 @@ class InstallerWindow(QWidget):
         self.back_b = QPushButton(tr("上一步"))
         self.install_b = QPushButton(tr("安装"))
         self.install_b.setObjectName("primary")
-        self.back_b.clicked.connect(lambda: self._go(0))
+        self.back_b.clicked.connect(self._on_path_back)
         self.install_b.clicked.connect(self._start_install)
         footer.addWidget(self.back_b)
         footer.addWidget(self.install_b)
@@ -1192,7 +1380,7 @@ class InstallerWindow(QWidget):
             self.path_in.setText(d)
 
     def _build_progress(self):
-        w, v, footer = self._make_page(2)
+        w, v, footer = self._make_page(3)
         v.addStretch(1)
         self.progress_title, self.progress_sub = self._add_logo_header(
             v,
@@ -1231,7 +1419,7 @@ class InstallerWindow(QWidget):
         self.stack.addWidget(w)
 
     def _build_success(self):
-        w, v, footer = self._make_page(3)
+        w, v, footer = self._make_page(4)
         v.addStretch(1)
         ok = SuccessIcon()
         v.addWidget(ok, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -1269,6 +1457,14 @@ class InstallerWindow(QWidget):
         self.lang_field_label.setText(tr("安装语言"))
         self.next_b.setText(tr("下一步"))
 
+        self.upgrade_title.setText(tr("检测到已安装"))
+        self.upgrade_sub.setText(tr("请选择本次安装方式"))
+        self.upgrade_keep_rb.setText(tr("保留数据升级安装"))
+        self.upgrade_clean_rb.setText(tr("彻底清除重新安装"))
+        self.upgrade_back_b.setText(tr("上一步"))
+        self.upgrade_next_b.setText(tr("下一步"))
+        self._update_upgrade_hint()
+
         self.path_title.setText(tr("选择安装位置"))
         self.path_sub.setText(
             tr("AT小PP 已准备安装到此目录") if self.inno_managed
@@ -1292,17 +1488,33 @@ class InstallerWindow(QWidget):
         self.open_b.setText(tr("立即打开"))
 
     def _start_install(self):
-        if self._timer.isActive() or self.stack.currentIndex() == 2:
+        if self._timer.isActive() or self.stack.currentIndex() == 3:
             show_running_warning(tr("安装正在进行捏~"))
             return
         self.install_dir = _norm_install_dir(self.path_in.text().strip() or self._default_dir())
         self.path_in.setText(self.install_dir)
+
+        # 彻底覆盖式安装：先终止运行中的应用，再清理安装目录与用户数据
+        if getattr(self, "_upgrade_mode", None) == "clean":
+            _terminate_installed_app(self.install_dir)
+            try:
+                if os.path.isdir(self.install_dir):
+                    shutil.rmtree(self.install_dir, ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
+            appdata_dir = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), APP_NAME)
+            try:
+                if os.path.isdir(appdata_dir):
+                    shutil.rmtree(appdata_dir, ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
+
         self._progress = 0
         self._backend_done = not bool(self.inno_setup_path)
         self._backend_ok = True
         self._backend_message = ""
         self._set_progress(0, self._progress_keys[0])
-        self._go(2)
+        self._go(3)
         if self.inno_setup_path:
             self._install_worker = InnoInstallWorker(self.inno_setup_path, self.install_dir)
             self._install_worker.finished.connect(self._on_backend_finished)
@@ -1320,7 +1532,7 @@ class InstallerWindow(QWidget):
         if self._progress >= 100:
             self._timer.stop()
             if self._finalize():
-                QTimer.singleShot(260, lambda: self._go(3))
+                QTimer.singleShot(260, lambda: self._go(4))
             return
         step = 1 if self._progress > 84 else 2
         self._progress = min(100, self._progress + step)

@@ -17,8 +17,6 @@ release/
 # 生成与缓存资源
 build_assets/
 data/music/temp/
-data/voice/Generated Voice Media/
-data/voice/*/Generated Voice Media/
 data/settings.json
 data/state.json
 data/alarms.json
@@ -32,3 +30,6 @@ release/*.zip
 # 本地运行痕迹
 *.log
 *.tmp
+
+# WorkBuddy 内部记忆 / agent 数据（非项目源码）
+.workbuddy/

@@ -762,6 +762,11 @@ class SettingsWindow(QDialog):
             label.setText(tr(source))
         self.back_btn.setText(tr("返回"))
         self.save_btn.setText(tr("保存"))
+        # 同步语言按钮 checked 状态，确保设置窗与托盘/配置一致
+        current = config.settings.get("language", "zh-CN")
+        self.lang = current
+        for btn, (_, lang_code) in zip(getattr(self, "lang_btns", []), LANGS):
+            btn.setChecked(lang_code == current)
         if hasattr(self, "admin_title"):
             self.admin_title.setText(tr("音频生成"))
             self.admin_desc.setText(tr("生成的音频可试听，保存后写入本地附加语音库"))

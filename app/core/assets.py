@@ -60,6 +60,8 @@ ASSET_ALIASES = {
     "是否上传": "upload_confirm",
     "刷手机": "phone_browsing",
     "睡觉": "sleep",
+    "左休息": "left_rest",
+    "右休息": "right_rest",
     "听歌": "music",
     "运动": "exercise",
     "调酒师": "bartender",
@@ -139,6 +141,18 @@ def get_work_final(name: str) -> str or None:
 
 def get_home_final(name: str) -> str or None:
     return find_image(name, os.path.join(pathutil.get_assets_dir(), "home"))
+
+
+def get_idle_rest_images(side: str) -> list:
+    """返回闲置休息图（left/right_*）。"""
+    root = pathutil.get_assets_dir()
+    prefix = "left_" if side == "left" else "right_"
+    result = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp"):
+        for p in glob.glob(os.path.join(root, "**", f"{prefix}*{ext[1:]}"), recursive=True):
+            if os.path.basename(p).lower().startswith(prefix):
+                result.append(p)
+    return sorted(result)
 
 
 def get_work_prep(name: str):

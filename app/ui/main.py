@@ -25,7 +25,7 @@ from app.core.voice import (
 )
 from app.core import todo, alarm as alarm_mod
 from app.ui.style import apply_theme
-from app.ui.pet_window import PetWindow
+from app.ui.pet_window import PetWindow, PET_WAKE_MESSAGE
 from app.ui.tray import TrayManager
 from app.ui.music_player import MusicPlayer
 from app.ui.todo_window import TodoWindow
@@ -53,14 +53,9 @@ def _wake_existing_main_window() -> bool:
         hwnd = user32.FindWindowW(None, title)
         if not hwnd:
             return False
-        sw_restore = 9
-        sw_shownormal = 1
-        flags = 0x0001 | 0x0002 | 0x0040
-        user32.ShowWindow(hwnd, sw_restore)
-        user32.ShowWindow(hwnd, sw_shownormal)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
-        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags)
+        # 由原实例在 Qt 主线程内完成显示，避免外部进程直接修改窗口状态，
+        # 导致 Qt 的 isVisible() 与 Win32 实际状态不同步。
+        user32.PostMessageW(hwnd, PET_WAKE_MESSAGE, 0, 0)
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -230,7 +225,8 @@ class App:
 
         self._topmost_released = False
         active = QApplication.activeWindow()
-        keep_on_top(self.pet)
+        if not state.hidden and self.pet.isVisible():
+            keep_on_top(self.pet)
         if self.scene is not None and self.scene.isVisible():
             keep_on_top(self.scene)
         for window in self.windows.values():
@@ -254,7 +250,8 @@ class App:
     def _release_app_topmost(self):
         if self._topmost_released:
             return
-        release_topmost(self.pet)
+        if not state.hidden and self.pet.isVisible():
+            release_topmost(self.pet)
         if self.scene is not None and self.scene.isVisible():
             release_topmost(self.scene)
         for window in self.windows.values():

@@ -160,6 +160,9 @@ class AppState(QObject):
     def mark_interaction(self):
         self.last_interaction = time.time()
 
+    def is_idle(self, seconds: int) -> bool:
+        return (time.time() - self.last_interaction) >= seconds
+
     def idle_minutes(self) -> float:
         return (time.time() - self.last_interaction) / 60.0
 

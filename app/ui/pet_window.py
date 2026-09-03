@@ -1,7 +1,7 @@
 """主宠物窗：透明无边框、可拖拽、右键菜单、上下文图片切换、悬浮表情包。
 
 图片显示优先级（依据开发需求文档）：
-1. 闲置超过 30 分钟 -> 睡觉图（播报『累了捏』）
+1. 闲置超过 1 分钟 -> 随机睡觉/左休息/右休息图（播报『累了捏』）
 2. 处于设置的工作时间段且用户未手动切换 -> 工作图（当前职业）
 3. 其余 -> 用户选择的服装图（默认衬衫）
 点击人物 -> 回到服装图（覆盖工作图），刷新交互时间。
@@ -14,7 +14,7 @@ from datetime import datetime
 
 from PyQt6.QtCore import Qt, QPoint, QPointF, QRectF, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QColor, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import QWidget, QLabel
+from PyQt6.QtWidgets import QWidget, QLabel, QApplication
 
 from app.core import config, pathutil
 from app.core.state import state
@@ -34,6 +34,7 @@ EMOJIS = [
 BASE_IMG = 200
 STATUS_W = 366
 STATUS_H = 215
+PET_WAKE_MESSAGE = 0x8001
 
 
 class EmojiBubble(QWidget):
@@ -90,6 +91,11 @@ class PetWindow(QWidget):
         self._prep_kind = None
         self._prep_name = None
         self._last_path = None
+        self._idle_kind = None
+        self._idle_path = None
+        self._hover_keepalive = QTimer(self)
+        self._hover_keepalive.setInterval(15000)
+        self._hover_keepalive.timeout.connect(self._keep_hover_alive)
         self._emoji_timer = QTimer(self)
         self._emoji_timer.setInterval(80)
         self._emoji_timer.timeout.connect(self._float_emoji)
@@ -122,6 +128,7 @@ class PetWindow(QWidget):
 
         self._build()
         self._enable_native_file_drop()
+        self.setMouseTracking(True)
         state.outfitChanged.connect(lambda _=None: self.refresh_image())
         self._enter_random_outfit()
 
@@ -133,6 +140,7 @@ class PetWindow(QWidget):
         self.status = StatusPanel(self)
         # 状态面板只负责展示，不能拦截拖到人物窗口的文件事件。
         self.status.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.status.setMouseTracking(True)
         self.emoji = EmojiBubble(self)
         self.emoji.hide()
         self.setAcceptDrops(True)
@@ -142,7 +150,8 @@ class PetWindow(QWidget):
         scale = config.settings.get("sizeScale", 100) / 100.0
         size = int(BASE_IMG * scale)
         self._img_size = size
-        window_w = max(STATUS_W, size)
+        idle_mode = self.mode in {"sleep", "left_rest", "right_rest"}
+        window_w = size if idle_mode else max(STATUS_W, size)
         self.img_label.setGeometry(0, 0, window_w, size)
         show_status = self.mode == "drink"
         self.status.setVisible(show_status)
@@ -169,14 +178,22 @@ class PetWindow(QWidget):
 
     def _draw(self, path):
         self._last_path = path
+        if self._idle_kind == "left_rest":
+            self.img_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        elif self._idle_kind == "right_rest":
+            self.img_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        else:
+            self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_label.setPixmap(self._load_pixmap(path))
 
     def _resolve(self):
         """根据上下文决定要显示的图片路径与模式。"""
         if self._forced_image is not None:
             return self._forced_image, "upload"
-        if state.idle_minutes() >= 30:
-            return assets.get_home_final("睡觉"), "sleep"
+        if not state.hidden and state.is_idle(60):
+            if self._idle_path is None:
+                self._idle_kind, self._idle_path = self._pick_idle_image()
+            return self._idle_path, self._idle_kind
         if self._drink_path and self.mode == "drink":
             return self._drink_path, "drink"
         if self._prep_path:
@@ -189,13 +206,44 @@ class PetWindow(QWidget):
             return state.current_outfit_image, "costume"
         return random.choice(assets.get_costume_images(state.current_outfit) or [""]), "costume"
 
+    def _pick_idle_image(self):
+        kind = random.choice(["sleep", "left_rest", "right_rest"])
+        if kind == "sleep":
+            return kind, assets.get_home_final("睡觉")
+        side = "left" if kind == "left_rest" else "right"
+        choices = assets.get_idle_rest_images(side)
+        if choices:
+            return kind, random.choice(choices)
+        return "sleep", assets.get_home_final("睡觉")
+
+    def _clear_idle_image(self):
+        self._idle_kind = None
+        self._idle_path = None
+
+    def _position_idle_window(self):
+        if self._idle_kind not in {"left_rest", "right_rest"}:
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        rect = screen.availableGeometry()
+        y = max(rect.top(), min(self.y(), rect.bottom() - self.height()))
+        if self._idle_kind == "left_rest":
+            self.move(rect.left(), y)
+        else:
+            self.move(rect.right() - self.width() + 1, y)
+
     def refresh_image(self, force=False):
         path, mode = self._resolve()
         prev = self.mode
         self.mode = mode
         if force or path != self._last_path:
             self._draw(path)
+        self._position_idle_window()
         if mode == "sleep" and prev != "sleep":
+            line = config.character.home.get("idleTimeoutLine", "累了捏")
+            say(line)
+        elif mode in {"left_rest", "right_rest"} and prev not in {"left_rest", "right_rest"}:
             line = config.character.home.get("idleTimeoutLine", "累了捏")
             say(line)
         self._relayout()
@@ -230,6 +278,8 @@ class PetWindow(QWidget):
 
     # ---------------- 交互 ----------------
     def mousePressEvent(self, e):
+        self._clear_idle_image()
+        state.mark_interaction()
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = e.globalPosition().toPoint()
             self._press_pos = e.globalPosition().toPoint()
@@ -237,6 +287,9 @@ class PetWindow(QWidget):
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        self._clear_idle_image()
+        if self.underMouse():
+            state.mark_interaction()
         if self._drag_pos is not None:
             delta = e.globalPosition().toPoint() - self._drag_pos
             if delta.manhattanLength() > 4:
@@ -262,6 +315,7 @@ class PetWindow(QWidget):
     def _on_click(self):
         self.ctx.stop_alarm()
         state.mark_interaction()
+        self._clear_idle_image()
         self._scene_path = None
         if self.mode != "costume" and self.mode != "drink":
             self.user_override = True
@@ -321,6 +375,9 @@ class PetWindow(QWidget):
                 return False, 0
 
             msg = wintypes.MSG.from_address(int(message))
+            if msg.message == PET_WAKE_MESSAGE:
+                self.do_show()
+                return True, 0
             if msg.message != 0x0233:  # WM_DROPFILES
                 return False, 0
 
@@ -498,12 +555,27 @@ class PetWindow(QWidget):
         self._upload_active = False
         self._upload_candidate = None
         self._upload_stage = None
+        self._clear_idle_image()
         self.refresh_image(force=True)
 
     def enterEvent(self, e):  # noqa: N802
+        self._hover_keepalive.start()
+        was_idle = self.mode in {"sleep", "left_rest", "right_rest"}
+        self._clear_idle_image()
+        state.mark_interaction()
+        if was_idle:
+            self.refresh_image(force=True)
         if self._emoji_enabled_for_mode():
             self._show_emoji()
         super().enterEvent(e)
+
+    def leaveEvent(self, e):  # noqa: N802
+        self._hover_keepalive.stop()
+        super().leaveEvent(e)
+
+    def _keep_hover_alive(self):
+        if self.underMouse():
+            state.mark_interaction()
 
     def _emoji_enabled_for_mode(self):
         return self.mode in {"costume", "drink", "sleep", "work", "home"}
@@ -618,6 +690,7 @@ class PetWindow(QWidget):
         self.mode = kind
         self.user_override = True
         state.mark_interaction()
+        self._clear_idle_image()
         self._draw(path)
         self._relayout()
 
@@ -629,6 +702,7 @@ class PetWindow(QWidget):
         self._scene_path = None
         self.mode = "preparing"
         self.user_override = True
+        self._clear_idle_image()
         self._draw(path)
         self._relayout()
 
@@ -643,6 +717,7 @@ class PetWindow(QWidget):
         self._prep_path = None
         self._prep_kind = None
         self._prep_name = None
+        self._clear_idle_image()
         self.refresh_image(force=True)
 
     def clear_drink_state(self):
@@ -651,6 +726,7 @@ class PetWindow(QWidget):
         self._prep_path = None
         self._prep_kind = None
         self._prep_name = None
+        self._clear_idle_image()
         if self.mode == "drink":
             self.mode = "costume"
         self.status.hide()
@@ -658,11 +734,21 @@ class PetWindow(QWidget):
 
     # ---------------- 隐身 ----------------
     def do_hide(self):
+        self._drag_pos = None
+        self._press_pos = None
+        self._moved = False
+        self._hover_keepalive.stop()
+        self._clear_idle_image()
+        state.mark_interaction()
         state.set_hidden(True)
         self.hide()
 
     def do_show(self):
+        self._clear_idle_image()
+        state.mark_interaction()
         state.set_hidden(False)
         self.refresh_image(force=True)
+        self.showNormal()
         self.show()
         self.raise_()
+        self.activateWindow()

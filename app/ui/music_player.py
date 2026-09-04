@@ -2337,20 +2337,26 @@ class PlayerWindow(QDialog):
         audio_files = [p for p in files if self._is_supported_drop_audio(p)]
         if audio_files:
             self._pending_drop_files = audio_files
-            self._show_drop_overlay(tr("是否上传该歌曲？"), "drop_upload_prompt", show_buttons=True)
+            self._show_drop_overlay("是否上传该歌曲", "drop_upload_prompt", show_buttons=True)
         else:
             self._pending_drop_files = []
             self._show_drop_overlay(
-                tr("我暂时不支持这种文件类型哦！"),
+                "我暂时不支持上传这种文件捏~",
                 "drop_upload_prompt",
                 show_buttons=False,
                 auto_restore=True,
                 restore_delay_ms=750,
             )
 
-    def _show_drop_overlay(self, message, image_name, show_buttons=False, auto_restore=False, restore_delay_ms=2000):
+    def _show_drop_overlay(self, message_key, image_name, show_buttons=False, auto_restore=False, restore_delay_ms=2000):
+        """显示拖放提示浮层。
+
+        message_key 为 i18n 文案 key：在此统一翻译并记录，切换界面语言时
+        浮层提示语与按钮可随 retranslate_ui 一起刷新（修复英文模式提示词残留中文）。
+        """
         self._drop_image_name = image_name
-        self.drop_message.setText(message)
+        self._drop_message_key = message_key
+        self.drop_message.setText(tr(message_key))
         self.drop_buttons.setVisible(show_buttons)
         img = assets.find_image(image_name)
         pix = _rounded_pixmap(img or "", QSize(286, 168), 16)
@@ -2375,9 +2381,9 @@ class PlayerWindow(QDialog):
         imported = self.music.add_files(files)
         self._pending_drop_files = []
         if imported:
-            self._show_drop_overlay(tr("上传成功了！"), "drop_upload_success", show_buttons=False, auto_restore=True, restore_delay_ms=750)
+            self._show_drop_overlay("上传成功！", "drop_upload_success", show_buttons=False, auto_restore=True, restore_delay_ms=750)
         else:
-            self._show_drop_overlay(tr("歌曲已存在"), "drop_upload_prompt", show_buttons=False, auto_restore=True)
+            self._show_drop_overlay("歌曲已存在", "drop_upload_prompt", show_buttons=False, auto_restore=True)
 
     def begin_open_session(self):
         self._auto_dock_enabled = True
@@ -2864,6 +2870,12 @@ class PlayerWindow(QDialog):
         self.favorite_b.setToolTip(tr("我喜欢的歌曲"))
         if hasattr(self, "notice"):
             self.notice.set_notice_text(tr("仅供学习交流使用，请支持正版音乐！"))
+        # 拖放浮层：是/否按钮随语言刷新；若浮层正显示，提示语也按 key 重译
+        if hasattr(self, "drop_yes_b"):
+            self.drop_yes_b.setText(tr("是"))
+            self.drop_no_b.setText(tr("否"))
+        if getattr(self, "_drop_message_key", None) and self.drop_overlay.isVisible():
+            self.drop_message.setText(tr(self._drop_message_key))
         self.sync()
 
 

@@ -36,7 +36,7 @@ from app.ui.scene_window import PreparationItemWindow
 from app.ui.install_window import (
     InstallerWindow, UninstallerWindow, acquire_single_instance,
     show_running_warning, schedule_inno_uninstall_cleanup, is_admin,
-    relaunch_as_admin,
+    relaunch_as_admin, launch_detached_deelevated,
 )
 from app.ui.common import keep_on_top, release_topmost
 
@@ -470,6 +470,13 @@ def main():
         return app.exec()
 
     # 正常模式
+    # 拖拽修复：正常模式运行时并不需要管理员权限。若本进程处于高完整性（例如安装
+    # 向导「立即打开」或右键「以管理员身份运行」所拉起的实例），Windows UIPI 会
+    # 拦截普通资源管理器的文件拖放（红圈禁止）。检测到后自动降权重启一次再退出；
+    # 降权不可用（如整个 shell 均提权）时继续以当前权限运行，保证应用可用。
+    if getattr(sys, "frozen", False) and is_admin():
+        if launch_detached_deelevated(sys.executable):
+            return 0
     init_voice()
     controller = App()
     return app.exec()

@@ -1601,11 +1601,10 @@ class InstallerWindow(QWidget):
     def _open_installed(self):
         exe = _installed_exe_path(self.install_dir) if self.inno_setup_path else os.path.join(self.install_dir, _dest_exe_name())
         if os.path.exists(exe):
-            try:
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                subprocess.Popen([exe], cwd=self.install_dir, close_fds=True, creationflags=creationflags)
-            except Exception:  # noqa: BLE001
-                pass
+            # 拖拽修复：安装向导以管理员(高完整性)运行，若直接 Popen，主程序会继承
+            # 高完整性令牌，导致资源管理器的文件拖放被 UIPI 拦截（红圈禁止）。
+            # 这里改走「降权启动」，让主程序以与源码模式一致的中等完整性运行。
+            launch_detached_deelevated(exe, cwd=self.install_dir)
         QApplication.instance().quit()
 
     def resizeEvent(self, e):  # noqa: N802
@@ -1801,6 +1800,232 @@ def relaunch_as_admin(argv: list[str]) -> bool:
         params = subprocess.list2cmdline(argv)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
         return rc > 32
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ---------------- 降权启动（拖拽修复） ----------------
+# 背景：安装向导以管理员(UAC, 高完整性)运行。若从向导直接 Popen 主程序，子进程会
+# 继承高完整性令牌。Windows UIPI(用户界面特权隔离) 会拦截来自普通资源管理器
+# (中等完整性 Explorer) 的文件拖放 —— 文件拖到宠物/播放器上显示「红圈禁止」；
+# 而源码模式(python main.py, 中等完整性)一切正常。因此凡是向导拉起主程序的场景，
+# 都必须以「中等完整性」启动，使其与源码模式行为一致。
+#
+# 启动策略（依次尝试，保证任何环境都能拉起应用）：
+#   1) 复制一个「未提权」的 explorer.exe 令牌 → CreateProcessWithTokenW（首选，可带工作目录）
+#   2) 经 explorer.exe 代理启动（Windows 认可的中等完整性启动方式，无法带工作目录）
+#   3) 直接 subprocess.Popen（与旧行为一致，仅兜底；高完整性环境下拖放仍会受限）
+
+
+def _enable_impersonate_privilege() -> bool:
+    """启用当前进程的 SeImpersonatePrivilege（CreateProcessWithTokenW 的必要权限）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", ctypes.c_long)]
+
+        class LUID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+        class TOKEN_PRIVILEGES(ctypes.Structure):
+            _fields_ = [("PrivilegeCount", wintypes.DWORD),
+                        ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+
+        TOKEN_ADJUST_PRIVILEGES = 0x0020
+        TOKEN_QUERY = 0x0008
+        SE_PRIVILEGE_ENABLED = 0x00000002
+
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, "SeImpersonatePrivilege", ctypes.byref(luid)):
+            return False
+        tok = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                         ctypes.byref(tok)):
+            return False
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+        ok = bool(advapi32.AdjustTokenPrivileges(tok, False, ctypes.byref(tp),
+                                                 ctypes.sizeof(tp), None, None))
+        kernel32.CloseHandle(tok)
+        return ok
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _duplicate_medium_explorer_token():
+    """复制一个「未提权(中等完整性)」的 explorer.exe 进程令牌。
+
+    返回令牌句柄(int)；失败返回 0。调用方负责 CloseHandle。
+    只接受未提权的 Explorer：若整个 shell 都以管理员运行（Explorer 也提权），
+    说明用户环境整体是高完整性，此时拖放双方同级别、不受 UIPI 影响，
+    也就没有必要降权 —— 返回 0 让上层走普通启动，避免无限降权循环。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                              ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                 wintypes.LPVOID, wintypes.DWORD,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+        advapi32.DuplicateTokenEx.restype = wintypes.BOOL
+        advapi32.DuplicateTokenEx.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                              wintypes.LPVOID, ctypes.c_int,
+                                              ctypes.c_int, ctypes.POINTER(wintypes.HANDLE)]
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", wintypes.LPVOID), ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", wintypes.WCHAR * 260)]
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        TOKEN_DUPLICATE = 0x0002
+        TOKEN_QUERY = 0x0008
+        MAXIMUM_ALLOWED = 0x02000000
+        TokenElevation = 20
+        SecurityImpersonation = 2
+        TokenPrimary = 1
+
+        snap = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if not snap:
+            return 0
+        try:
+            pe = PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(pe))
+            while ok:
+                if pe.szExeFile.lower() == "explorer.exe":
+                    h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                                  pe.th32ProcessID)
+                    if h_proc:
+                        h_tok = wintypes.HANDLE()
+                        if advapi32.OpenProcessToken(h_proc, TOKEN_DUPLICATE | TOKEN_QUERY,
+                                                     ctypes.byref(h_tok)):
+                            elev = wintypes.DWORD(0)
+                            sz = wintypes.DWORD(0)
+                            advapi32.GetTokenInformation(h_tok, TokenElevation,
+                                                         ctypes.byref(elev), 4, ctypes.byref(sz))
+                            if not elev.value:  # 未提权(中等完整性)的 Explorer
+                                h_new = wintypes.HANDLE()
+                                if advapi32.DuplicateTokenEx(h_tok, MAXIMUM_ALLOWED, None,
+                                                             SecurityImpersonation,
+                                                             TokenPrimary,
+                                                             ctypes.byref(h_new)):
+                                    kernel32.CloseHandle(h_tok)
+                                    kernel32.CloseHandle(h_proc)
+                                    return int(h_new.value or 0)
+                            kernel32.CloseHandle(h_tok)
+                        kernel32.CloseHandle(h_proc)
+                ok = kernel32.Process32NextW(snap, ctypes.byref(pe))
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def launch_detached_deelevated(exe: str, cwd: str | None = None) -> bool:
+    """以「中等完整性（非管理员）」分离启动 exe，返回是否成功。
+
+    非管理员环境（如源码模式）直接启动；管理员环境按上面三条策略依次降权启动。
+    """
+    if os.name != "nt":
+        return False
+    # 非管理员环境（源码模式 / 普通用户启动向导）：无需降权，保持原启动方式。
+    if not is_admin():
+        try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen([exe], cwd=cwd, close_fds=True, creationflags=creationflags)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    # 1) 首选：复制中等完整性 Explorer 令牌 → CreateProcessWithTokenW（可带工作目录）
+    token = _duplicate_medium_explorer_token()
+    if token:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            advapi32 = ctypes.windll.advapi32
+            kernel32 = ctypes.windll.kernel32
+
+            class STARTUPINFOW(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
+                            ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
+                            ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                            ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+                            ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD),
+                            ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                            ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                            ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+                            ("hStdInput", wintypes.HANDLE), ("hStdOutput", wintypes.HANDLE),
+                            ("hStdError", wintypes.HANDLE)]
+
+            class PROCESS_INFORMATION(ctypes.Structure):
+                _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                            ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+            advapi32.CreateProcessWithTokenW.restype = wintypes.BOOL
+            advapi32.CreateProcessWithTokenW.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                wintypes.DWORD, wintypes.LPVOID, wintypes.LPCWSTR,
+                ctypes.POINTER(STARTUPINFOW), ctypes.POINTER(PROCESS_INFORMATION)]
+
+            _enable_impersonate_privilege()
+            si = STARTUPINFOW()
+            si.cb = ctypes.sizeof(STARTUPINFOW)
+            pi = PROCESS_INFORMATION()
+            cmd = '"%s"' % exe.replace('"', '\\"')
+            ok = advapi32.CreateProcessWithTokenW(
+                wintypes.HANDLE(token), 0, exe, cmd, 0, None,
+                cwd or None, ctypes.byref(si), ctypes.byref(pi))
+            kernel32.CloseHandle(wintypes.HANDLE(token))
+            if ok:
+                if pi.hProcess:
+                    kernel32.CloseHandle(pi.hProcess)
+                if pi.hThread:
+                    kernel32.CloseHandle(pi.hThread)
+                return True
+        except Exception:  # noqa: BLE001
+            try:
+                ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(token))
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 2) 次选：经 explorer.exe 代理启动（同样以中等完整性运行，无法指定工作目录）
+    try:
+        subprocess.Popen(["explorer.exe", exe], close_fds=True)
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3) 兜底：与旧行为一致，直接启动（高完整性环境下拖放仍受限，但至少能打开应用）
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen([exe], cwd=cwd, close_fds=True, creationflags=creationflags)
+        return True
     except Exception:  # noqa: BLE001
         return False
 

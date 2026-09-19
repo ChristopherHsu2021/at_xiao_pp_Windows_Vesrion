@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import QWidget, QLabel, QHBoxLayout, QVBoxLayout, QSizePoli
 
 from app.core import config
 from app.core.state import state
+from app.core.i18n import tr
 
 
 class Bar(QWidget):
@@ -69,7 +70,7 @@ class StatusPanel(QWidget):
         )
         self.icon.setFixedSize(41, 41)
         self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.drink_name = QLabel("伏特加")
+        self.drink_name = QLabel(tr("伏特加"))
         self.drink_name.setStyleSheet("font-size: 14px; font-weight: 800; color: #3d2b1f;")
         self.drink_sub = QLabel("")
         self.drink_sub.setStyleSheet("font-size: 11px; color: #a08e7a;")
@@ -89,13 +90,13 @@ class StatusPanel(QWidget):
         root.addLayout(header)
 
         self.tipsy_bar = Bar("#ff7a1a", width=314, height=8)
-        root.addLayout(self._row("微醺值", self.tipsy_bar, "tipsy_val"))
+        root.addLayout(self._row(tr("微醺值"), self.tipsy_bar, "tipsy_val"))
         self.sober_bar = Bar("#64bb6a", width=314, height=8)
-        root.addLayout(self._row("清醒值", self.sober_bar, "sober_val"))
+        root.addLayout(self._row(tr("清醒值"), self.sober_bar, "sober_val"))
 
         bottom = QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 0)
-        self.status_pill = QLabel("清醒")
+        self.status_pill = QLabel(tr("清醒"))
         self.status_pill.setStyleSheet(
             "background: rgba(249,117,16,0.08); border: 1px solid rgba(249,117,16,0.28);"
             " color: #ff7613; font-size: 11px; font-weight: 800; padding: 6px 13px; border-radius: 13px;"
@@ -148,15 +149,15 @@ class StatusPanel(QWidget):
         if state.current_drink:
             self.drink_name.setText(state.current_drink)
             self.drink_sub.setText(self._drink_subtitle(state.current_drink))
-            self.count_label.setText(f"今日已饮用 {state.drinks_count} 杯")
+            self.count_label.setText(tr("今日已饮用 {n} 杯").format(n=state.drinks_count))
         else:
-            self.drink_name.setText("AT小PP")
+            self.drink_name.setText(tr("AT小PP"))
             self.drink_sub.setText("")
             self.count_label.setText("")
 
     def _status_label(self):
         if state.status == "清醒":
-            return "清醒"
+            return tr("清醒")
         if state.status.endswith("中"):
             return state.status
         return f"{state.status}中"

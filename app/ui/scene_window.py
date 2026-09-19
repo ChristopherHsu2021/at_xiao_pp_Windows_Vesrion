@@ -141,7 +141,7 @@ class SceneWindow(GlassWindow):
         )
         root.addWidget(self.canvas, 1)
 
-        self.hint = QLabel("把『人物』拖到『物品』上，凑到一起就能触发捏～")
+        self.hint = QLabel(tr("把『人物』拖到『物品』上，凑到一起就能触发捏～"))
         self.hint.setStyleSheet("font-size:12px;color:#a08e7a;text-align:center;")
         self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(self.hint)

@@ -16,11 +16,17 @@ release/
 
 # 生成与缓存资源
 build_assets/
-data/music/temp/
+data/music/
+data/tts/
 data/settings.json
 data/state.json
 data/alarms.json
 data/todos.json
+
+# offscreen 验证脚本产出的截图（临时验收用，不入库）
+/color_popup.png
+/sticky_*.png
+/todo_header.png
 
 # 安装包与发布文件
 installer/*.exe

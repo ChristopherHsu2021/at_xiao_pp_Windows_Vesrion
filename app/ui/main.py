@@ -38,7 +38,7 @@ from app.ui.install_window import (
     show_running_warning, schedule_inno_uninstall_cleanup, is_admin,
     relaunch_as_admin, launch_detached_deelevated,
 )
-from app.ui.common import keep_on_top, release_topmost
+from app.ui.common import keep_on_top, release_topmost, popup_open
 
 
 APP_INSTANCE_MUTEX = "Local\\ATXiaoPPMain"
@@ -220,7 +220,9 @@ class App:
         if self._foreground_belongs_to_other_app():
             self._release_app_topmost()
             return
-        if self._popup_menu_open:
+        # 有弹出窗口（右键菜单 / 下拉列表 / 日历 / 模态框）时不要重申置顶：
+        # 否则会把弹窗压到卡片下面，或抢走激活导致弹窗立刻关闭（下拉「闪退」）。
+        if self._popup_menu_open or popup_open():
             return
 
         self._topmost_released = False

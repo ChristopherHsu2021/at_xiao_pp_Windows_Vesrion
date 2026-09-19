@@ -37,11 +37,15 @@ def save(tasks: list):
         pass
 
 
-def add(content: str, remind: str = None, alarm_id=None) -> dict:
+def add(title: str, content: str, remind: str = None, alarm_id=None,
+        priority: str = "中") -> dict:
+    """新增任务。title 为纯文本标题；content 为富文本 HTML；priority 为 低/中/高。"""
     tasks = load()
     item = {
         "id": int(time.time() * 1000),
+        "title": title,
         "content": content,
+        "priority": priority,
         "done": False,
         "remind": remind,
         "remind_enabled": remind is not None,
@@ -95,12 +99,15 @@ def delete_task(tid) -> bool:
     return True
 
 
-def update_task(tid, content: str, remind: str = None, alarm_id=None,
-                remind_enabled: bool | None = None) -> dict | None:
+def update_task(tid, title: str, content: str, remind: str = None, alarm_id=None,
+                remind_enabled: bool | None = None, priority: str | None = None) -> dict | None:
     tasks = load()
     for task in tasks:
         if task.get("id") == tid:
+            task["title"] = title
             task["content"] = content
+            if priority is not None:
+                task["priority"] = priority
             task["remind"] = remind
             task["alarm_id"] = alarm_id
             if remind_enabled is not None:
@@ -140,7 +147,11 @@ def sync_from_alarm(alarm: dict) -> bool:
             if remind is not None:
                 task["remind"] = remind
             if alarm.get("custom_text"):
-                task["content"] = alarm["custom_text"]
+                # 新任务以标题为主显示，回写标题；旧任务无标题字段则回写内容。
+                if "title" in task:
+                    task["title"] = alarm["custom_text"]
+                else:
+                    task["content"] = alarm["custom_text"]
             changed = True
     if changed:
         save(tasks)
@@ -149,6 +160,48 @@ def sync_from_alarm(alarm: dict) -> bool:
 
 def all_tasks() -> list:
     return load()
+
+
+def get_task(tid) -> dict | None:
+    """按 id 取单个任务（便签窗口双向同步时实时读取最新 done 状态用）。"""
+    for t in load():
+        if t["id"] == tid:
+            return t
+    return None
+
+
+def set_done(tid, done: bool) -> bool:
+    """把指定任务置为 done（便签窗口与列表项双向同步的唯一持久化入口）。
+
+    与 toggle 不同：set_done 设定为明确的目标值，避免「列表勾选」与「便签确认」
+    两个入口互相抵消。完成任务即结束提醒（移除关联闹钟），与 toggle 行为一致。
+    """
+    tasks = load()
+    for t in tasks:
+        if t["id"] == tid:
+            target = bool(done)
+            if t["done"] == target:
+                return t["done"]
+            t["done"] = target
+            if t["done"] and t.get("alarm_id"):
+                alarm_mod.delete(t["alarm_id"])
+                t["alarm_id"] = None
+                t["remind"] = None
+            save(tasks)
+            return t["done"]
+    return False
+
+
+def set_note(tid, title: str, content: str) -> bool:
+    """便签窗口关闭/改标题时回写标题与富文本内容（不影响提醒/优先级/闹钟）。"""
+    tasks = load()
+    for t in tasks:
+        if t["id"] == tid:
+            t["title"] = title
+            t["content"] = content
+            save(tasks)
+            return True
+    return False
 
 
 def cleanup_weekly() -> bool:

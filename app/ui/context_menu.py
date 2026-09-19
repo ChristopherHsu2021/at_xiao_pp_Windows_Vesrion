@@ -5,8 +5,10 @@
 尼格罗尼 在文档中标注『此处不显示』，故跳过。
 """
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import QGraphicsDropShadowEffect, QMenu, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtCore import Qt, QTimer, QEvent, QPoint, QRect
+from PyQt6.QtWidgets import (
+    QApplication, QGraphicsDropShadowEffect, QMenu, QPushButton, QVBoxLayout, QWidget,
+)
 from PyQt6.QtGui import QAction
 from PyQt6.QtGui import QColor
 
@@ -99,7 +101,14 @@ class ActionPopupMenu(QWidget):
             lay.addWidget(btn)
 
     def _trigger(self, callback):
-        self.close()
+        # 与 EditContextMenu._trigger 同款防护：本类若带 WA_DeleteOnClose，
+        # close() 后再被触发（回调链多包一层 / Qt 已先行关闭 popup）会抛
+        # RuntimeError: wrapped C/C++ object ... has been deleted，故吞掉异常、
+        # 保证业务回调照常异步执行。
+        try:
+            self.close()
+        except RuntimeError:
+            pass
         QTimer.singleShot(0, callback)
 
     def show_at(self, global_pos):
@@ -121,7 +130,53 @@ class ActionPopupMenu(QWidget):
             self.move(global_pos)
         self.show()
         self.raise_()
+        # 安装全局事件过滤器：点菜单外部 / 按 Esc / 父窗口失活 时自动关闭
+        QApplication.instance().installEventFilter(self)
         return self
+
+    def closeEvent(self, e):  # noqa: N802
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:  # noqa: BLE001
+            pass
+        super().closeEvent(e)
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        """让普通 QWidget 弹层获得「点击外部即消失」的能力（QMenu 原生就有，
+        ActionPopupMenu 是自定义 QWidget，需要自己处理）。
+
+        覆盖三种场景：
+        - 鼠标按下/抬起落在菜单之外 → 关闭；
+        - 按 Esc → 关闭，并吞掉该事件，避免被父窗口当成「关闭整个窗口」；
+        - 父窗口失活（切到别的程序）→ 关闭。
+
+        注意：本过滤器装在 QApplication 上是**全局**过滤器，部分事件的 obj 可能是
+        QWindow（例如实机里 WindowDeactivate、以及点击落在非 QWidget 区域时），
+        QWindow 不是 QWidget，调用 isAncestorOf 会抛 TypeError —— 必须先 isinstance 判定。
+        """
+        et = event.type()
+        if et == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+            self.close()
+            return True
+        if et in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+            # 菜单内部（含卡片与按钮）的点击不关闭；obj 可能是 QWindow，先 isinstance 判定
+            inside = obj is self or (isinstance(obj, QWidget) and self.isAncestorOf(obj))
+            if inside:
+                return False
+            gp = (event.globalPosition().toPoint()
+                  if hasattr(event, "globalPosition") else event.globalPos())
+            rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
+            if not rect.contains(gp):
+                self.close()
+            return False
+        if et == QEvent.Type.WindowDeactivate:
+            # 实机里 WindowDeactivate 的 obj 是 QWindow；用「父窗口是否仍是活动窗口」判断，
+            # 既绕开 obj 类型问题，又能正确覆盖「切到别的程序/别的窗口」。
+            pw = self.parentWidget()
+            if pw is not None and (obj is pw or QApplication.activeWindow() is not pw):
+                self.close()
+            return False
+        return super().eventFilter(obj, event)
 
 
 def _style_menu(menu):

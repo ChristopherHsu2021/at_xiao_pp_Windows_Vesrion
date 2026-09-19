@@ -1559,7 +1559,7 @@ class InstallerWindow(QWidget):
 
     def _on_finished(self, ok):
         if not ok:
-            self.prog_text.setText("安装失败")
+            self.prog_text.setText(tr("安装失败"))
             return
         self._finalize()
         self.stack.setCurrentIndex(3)

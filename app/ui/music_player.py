@@ -294,13 +294,13 @@ def _remote_dedupe_key(item: dict) -> tuple[str, str]:
 def _track_display_title(path: str) -> str:
     title, artist = _split_track_artist(path)
     label = title if not artist else f"{title} - {artist}"
-    return f"{label} · 缓存" if music_api.is_cache_path(path) else label
+    return f"{label} · {tr('缓存')}" if music_api.is_cache_path(path) else label
 
 
 def _remote_display_title(item: dict) -> str:
     title = item.get("name") or tr("未知歌曲")
     artist = item.get("artist") or tr("未知歌手")
-    return f"{title} - {artist} · 在线"
+    return f"{title} - {artist} · {tr('在线')}"
 
 
 def _duration_from_seconds(seconds: int | None) -> str:

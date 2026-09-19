@@ -1,4 +1,4 @@
-# 变更日志：任务清单 / 便签卡片模块（2026-09-19 16:22 → 2026-09-20 01:02）
+# 变更日志：任务清单 / 便签卡片模块（2026-09-19 16:22 → 2026-09-20 06:16）
 
 > 用途：梳理本时段内对「任务清单列表页」「添加/编辑页」「便签卡片窗口」及其右键菜单、i18n 所做的**全部代码改动**，描述**最终落定状态**（对比改动前原始实现）。
 > 重点面向**跨平台（macOS）迁移**：凡涉及 Windows 专属 API / 字体 / 窗口层级的地方，均在文末「跨平台迁移重点」中单列。
@@ -8,9 +8,10 @@
 
 ## 0. 范围与基线
 
-- 本日志覆盖 **2026-09-19 16:22 起至 2026-09-20 01:02** 之间的改动。同一天更早期还有多轮 UI 重构（列表页重构、添加/编辑页、卜卜 PeekCard 渲染、便签窗口严格对齐 HTML、卡顿优化等），那些轮次的**最终代码形态**已体现在本日志涉及的文件里，但逐轮历史不在此展开。
-- 所有改动目前**未 git 提交、未重新打包**（状态持续至今）。
+- 本日志覆盖 **2026-09-19 16:22 起至 2026-09-20 06:16** 之间的改动。同一天更早期还有多轮 UI 重构（列表页重构、添加/编辑页、卜卜 PeekCard 渲染、便签窗口严格对齐 HTML、卡顿优化等），那些轮次的**最终代码形态**已体现在本日志涉及的文件里，但逐轮历史不在此展开。
+- **版本状态（2026-09-20 06:16 更新）**：全部改动已提交并推送至 Gitee `main` —— 提交 **`ddf85fd`**；推送前基线打有快照 tag **`snapshot-2026-09-20-0616`**（指向 `c28e023`「修复卸载功能完整性」），回退用 `git checkout snapshot-2026-09-20-0616`。**尚未重新打包**（见第 6 节）。
 - 涉及主文件：`app/ui/todo_window.py`、`app/ui/rich_editor.py`、`app/ui/common.py`、`app/ui/context_menu.py`、`app/core/i18n.py`；验证脚本：`atpp_validate.py` 及若干 `atpp_verify_*.py`。
+- 本轮（01:02 之后）追加修复：便签菜单点击崩溃（3.3b）、复制任务新便签级联错位（3.5），并同步修正了 `atpp_validate.py` 中的过时断言（见第 5 节）。
 
 ---
 
@@ -83,7 +84,17 @@
 - **平台**：纯 Python/Qt 语义，**macOS 同因同解**。⚠️ macOS 上 popup 关闭时机与 Win 略有差异，这层 `try/except` 防护在 Mac 上同样必要（且更可能被 Qt 先行关闭 popup）。
 - **通用红线**：`WA_DeleteOnClose` + 「回调链里再次触发自身关闭」= 悬空 wrapper 崩溃。菜单/弹窗类的关闭动作必须只包一层，且容忍对象已销毁。
 
-### 3.4 便签右键菜单架构（本轮前已完成，列此备查）
+### 3.4 「复制任务」新开便签的级联错位（2026-09-20 续）
+- **文件**：`app/ui/todo_window.py` —— `TodoWindow.open_sticky` / 新增 `_cascade_sticky` / `StickyNoteWindow.copy_task`。
+- **原始**：`open_sticky(task)` 只做「新建 + show()」，新窗口位置由 Qt 默认决定，常与原便签**完全重叠** → 用户点了「复制任务」看不到变化，误以为没复制成功。
+- **最终方案**：
+  - `open_sticky(task, base=None)` 新增可选参照窗口 `base`；**不传时行为零改动**（列表页点标题打开便签仍走 Qt 默认位置）。
+  - `_cascade_sticky(win, base)`：新窗摆到 base 右下，步长 `CASCADE_STEP=28`；错开量按「已开便签数 − 1」递增（连点复制不会层层重合），`CASCADE_MAX=8` 步后回绕，避免越飘越远。
+  - **必须夹紧到屏幕可用区**（`QApplication.screenAt(base.pos())` 取屏 → `availableGeometry()`）：右下放不下就翻到 base 左上，保证新窗完整可见；否则错到屏幕外反而找不到新便签。
+  - `copy_task()` 改为 `open_sticky(new_task, base=self)`。
+- **平台**：纯 Qt（`screenAt` / `availableGeometry` / `move`），跨平台无碍。⚠️ macOS 多屏下 `screenAt` 语义一致，但需注意菜单栏/ dock 占用的可用区（Qt 的 `availableGeometry` 已扣除，行为一致）。
+
+### 3.5 便签右键菜单架构（本轮前已完成，列此备查）
 - 菜单改为「原生编辑块 + 自定义块」（`STICKY_EDIT_ITEMS` / `STICKY_EDIT_SHORTCUTS`）；`_do_edit(act)` 按 `target` 类型作用于 `QTextEdit`/`QLineEdit`（删除：QTextEdit 走 `textCursor().removeSelectedText()`，QLineEdit 走 `del_()`）；顶层 `Qt.Popup` 由 Qt 负责「点外部/Esc 关闭」；i18n 词条含 Undo/Redo/Cut/Copy/Paste/Copy Task/Clear Content/Sticky Background 等。
 - **关键根因（勿再误诊）**：`QTextEdit` 右键 `ContextMenu` 事件投递给它的 **`viewport()` 而非 QTextEdit 本身**，过滤器必须装在 viewport 上（见 `StickyNoteWindow._build_note` 的 `self.editor.editor.viewport().installEventFilter(self)`）。
 
@@ -115,14 +126,27 @@
 
 ## 5. 验证状态
 
-- 新增/复用 offscreen 回归脚本（均在 managed python 3.13.12 venv 跑）：
+- 新增/复用 offscreen 回归脚本（**均在项目自带 `venv`（PyQt6 已装）下跑通**）：
   - `atpp_verify_fixes.py`：崩溃修复 + "All" —— **8/8 PASS**。
   - `atpp_verify_elide.py`：标题省略号 + 动态长度 + 不遮挡 —— **16/16 PASS**。
   - `atpp_verify_menu_hover.py`：菜单两行 + hover 显示全 —— **11/11 PASS**。
-  - `atpp_validate.py`：综合断言（100+ 条）。⚠️ 本沙箱构造 `StickyNoteWindow` 必现 C 级崩溃（exit 127，环境特有，非代码回归），故该脚本在沙箱跑不全；**需在真实机器 `python main.py` 跑**。
+  - `atpp_verify_menu_crash.py`：便签菜单点击崩溃回归（走完整 `clicked → _trigger` 链路）—— **8/8 PASS**。
+  - `atpp_verify_cascade.py`：复制任务级联错位 + 屏幕边界回绕 —— **9/9 PASS**。
+  - `atpp_validate.py`：综合断言 —— **126/126 ALL PASS**（本轮新增 2 条：复制任务传 `base=原窗`、新便签不与原窗重叠）。
+- 本轮同步修正了 `atpp_validate.py` 里的**过时断言**：拖拽一条原本断言「点标题栏空白 → `startSystemMove()`」，而实现已改为 `grabMouse` 手动拖拽（3.2），现改为校验 `w._drag` 状态（空白→建立 / 点按钮→无 / 锁定→无）。
+- ⚠️ 沙箱差异提示：本沙箱的 **managed** python venv 下构造 `StickyNoteWindow` 曾必现 C 级崩溃（exit 127，无 traceback）；改用**项目 `venv`** 后 `atpp_validate.py` 可完整跑通 126 项。若换环境跑不动，先确认用的是项目 `venv` 的解释器。
 - ⚠️ 所有**视觉/交互**（拖拽手感、hover 滑动、菜单弹出位置、卜卜 PeekCard 渲染、字体渲染、卡顿根治程度）仍需用户在源码模式 `python main.py` 实机确认；offscreen 仅验证结构与几何。
 
 ---
 
-## 6. 提交 / 打包 待办（用户尚未执行）
-- 验收通过后：`git` 提交本时段全部改动；按既有三段打包链路重出安装包（PyInstaller → ISCC → bootstrap），并回归历史修复（UIPI 降权、播放器 i18n、卸载脚本 CRLF）。
+## 6. 提交 / 打包 状态与待办
+
+**已完成（2026-09-20 06:16）**
+- `git` 提交并推送至 Gitee `main`：提交 **`ddf85fd`**「任务清单/便签卡片重构 + 多处崩溃修复（2026-09-20）」。
+- 版本快照 tag **`snapshot-2026-09-20-0616`** → 基线 `c28e023`，已随 `--follow-tags` 一并推送（仓库首个 tag）。回退：`git checkout snapshot-2026-09-20-0616`。
+- 仓库卫生：停止跟踪运行期文件 `data/settings.json`、`data/state.json`（`.gitignore` 早有声明但对已跟踪文件无效，故用 `git rm --cached`，本地文件保留）；新增忽略 `data/music/`、`data/tts/`（≈6.4MB 运行数据）与根目录 offscreen 验证截图（`/color_popup.png`、`/sticky_*.png`、`/todo_header.png`）。
+
+**待办（尚未执行）**
+- 按既有三段打包链路重出安装包：**PyInstaller（`build.spec`）→ ISCC（`installer/AT小PP.iss`）→ bootstrap（`bootstrap.spec`）**，产物 `release/AT小PP-<version>-setup.exe`。
+- 打包前硬性前置（managed 解释器缺一必出废包）：`pip install PyQt6 comtypes pycryptodome opencc-python-reimplemented pypinyin audioop-lts`；`audioop` 已从 Py3.13 标准库移除，`app/core/voice.py` 需 `audioop-lts`。
+- 出包后回归历史修复：**UIPI 降权拖放**（`install_window.launch_detached_deelevated` / `main.py` frozen+admin 降权重启）、播放器 i18n、**卸载脚本 CRLF**（`uninstall_at_xiaopp.bat` 必须 CRLF，3883B / md5 ff8540…，被改成 LF 会导致 cmd 中途死、卸载失效）。

@@ -15,7 +15,7 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
-from PyQt6.QtCore import QTimer, QPoint
+from PyQt6.QtCore import Qt, QTimer, QPoint
 
 from app.core import assets, config, pathutil
 from app.core.state import state
@@ -264,15 +264,28 @@ class App:
         self._topmost_released = True
 
     def _foreground_belongs_to_other_app(self):
+        """判断当前是否应「让路」：用户切到其它软件时，本程序窗口不再强制置顶。
+
+        跨平台：应用失活(applicationState != ApplicationActive)即视为让路；
+        Windows 再叠加 GetForegroundWindow 精确判定（前台窗口不属于本程序）。
+        命中即触发 _release_app_topmost()，窗口降到普通层级但保持可见（不隐藏）。
+        """
         try:
-            import ctypes
-            foreground = ctypes.windll.user32.GetForegroundWindow()
-            if not foreground:
-                return False
-            own_handles = {int(w.winId()) for w in QApplication.topLevelWidgets() if w is not None}
-            return foreground not in own_handles
+            if QApplication.applicationState() != Qt.ApplicationState.ApplicationActive:
+                return True
         except Exception:  # noqa: BLE001
-            return False
+            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                foreground = ctypes.windll.user32.GetForegroundWindow()
+                if not foreground:
+                    return False
+                own_handles = {int(w.winId()) for w in QApplication.topLevelWidgets() if w is not None}
+                return foreground not in own_handles
+            except Exception:  # noqa: BLE001
+                return False
+        return False
 
     def open_todo(self):
         self._single("todo", lambda: TodoWindow(self))
